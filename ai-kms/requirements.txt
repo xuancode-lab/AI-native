@@ -1,0 +1,6 @@
+# AI-native KMS 依赖清单（纯 Python，Windows 本地）
+PySide6>=6.6.0          # 桌面 UI
+watchdog>=3.0.0         # 文件夹监听自动收录
+requests>=2.31.0        # Claude API / 分类器 provider 网络
+python-dotenv>=1.0.0    # 密钥/配置注入
+jieba>=0.42.1           # 中文分词（BM25/关键词/去重指纹）
