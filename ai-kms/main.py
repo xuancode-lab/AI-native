@@ -11,7 +11,10 @@
   python main.py batch <dir>           # 批量收录目录下所有 .md/.txt
   python main.py reindex               # 从 Vault 现有文件重建索引（DB 丢失后恢复）
   python main.py fts-rebuild           # FTS 全文索引对账重建（分批直到补齐）
+  python main.py export [dir]          # 导出结构层 JSONL+图谱（缺省 data/exports/<时间戳>）
+  python main.py export-full [dir]     # 全库打包 zip（原文 .md + 结构 + manifest）
   python main.py curator "<子命令…>"    # 知识策展：dry/scan/list/reread/apply/approve-high
+  python main.py mcp                   # 启动 MCP 只读服务（stdio，给外部 AI 客户端）
   python main.py ask "<问题>"           # AI 管家 RAG 问答
   python main.py gui                   # 启动桌面端（PySide6）
 """
@@ -117,6 +120,25 @@ def cmd_fts_rebuild(store, vault):
             break
     n_fts, n_vault = store.fts_health()
     print(f"FTS 重建完成：{total} 篇 · 当前 fts={n_fts} / 登记={n_vault}")
+
+
+def cmd_export(store, vault, arg, full: bool):
+    """导出派生资产（core/export.py）：structure 只导结构，full 打全库 zip。"""
+    from datetime import datetime
+    from pathlib import Path
+    from core.export import export_full, export_structure
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path(arg) if arg else settings.PROJECT_ROOT / "data" / "exports" / stamp
+    if full:
+        zp = export_full(store, vault, out)
+        print(f"全库打包完成 → {zp}（{zp.stat().st_size / 1024:.0f} KB）")
+        return
+    m = export_structure(store, vault, out)
+    c = m["counts"]
+    print(f"结构导出完成 → {out / 'structure'}")
+    print(f"  {c['files']} 篇 · {c['atoms']} 原子 · {c['links']} 链 · "
+          f"{c['classifications']} 分类 · {c['suggestions']} 建议 · "
+          f"图谱 {c['graph_nodes']} 节点 / {c['graph_edges']} 边")
 
 
 def cmd_curator(store, vault, arg):
@@ -225,6 +247,12 @@ def main():
     ap.add_argument("arg", nargs="?")
     a = ap.parse_args()
 
+    if a.cmd == "mcp":
+        # 只读 MCP：必须早退在 build() 之前——否则可写 store 会静默建空库 schema，
+        # 把"库不存在"的错误吞掉。字典分发里不放 mcp。
+        from core.mcp_server import run_stdio_server
+        run_stdio_server()
+        return
     store, vault = build()
     fn = {
         "scan": lambda: cmd_scan(store, vault),
@@ -236,6 +264,8 @@ def main():
         "batch": lambda: cmd_batch(store, vault, a.arg or str(settings.PROJECT_ROOT / "data" / "dropbox")),
         "reindex": lambda: cmd_reindex(store, vault),
         "fts-rebuild": lambda: cmd_fts_rebuild(store, vault),
+        "export": lambda: cmd_export(store, vault, a.arg, full=False),
+        "export-full": lambda: cmd_export(store, vault, a.arg, full=True),
         "curator": lambda: cmd_curator(store, vault, a.arg or ""),
         "ask": lambda: cmd_ask(store, vault, a.arg or ""),
         "gui": lambda: _launch_gui(),

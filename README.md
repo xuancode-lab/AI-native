@@ -47,6 +47,7 @@
 - [x] **阶段 5** —— 全区域可操作：编辑/新建/重命名/删除/回滚/相关笔记跳转（21/21 通过）
 - [x] **阶段 6 · 收录增强** —— 导入文件夹 + 树拖拽入库 + 知识节点簇 SVG 树图标 + 预览 `[[双链]]` 可点击渲染
 - [x] **阶段 7 · AI 管家完善一期** —— FTS5 检索地基 + 图谱倒排/epoch 缓存 + 建议审阅队列 + 双链生成/分类校准（curator，纯规则离线可用）+ 挂载体系 + 设置面板（75/75 通过）
+- [x] **阶段 8 · 资产开放一期** —— 结构导出（JSONL/图谱/全库 zip）+ MCP 只读服务（四工具，外部 AI 低成本调用知识库，108/108 通过）
 
 ---
 
@@ -78,6 +79,9 @@ python main.py ingest path/file.md  # 收录一个文件
 python main.py batch <dir>          # 批量收录目录下所有 .md/.txt
 python main.py reindex              # 从 Vault 现有文件重建索引（DB 丢失后恢复）
 python main.py fts-rebuild          # 全文检索索引对账重建（补漏/清幽灵）
+python main.py export [dir]         # 导出结构层资产：JSONL+图谱+manifest（缺省 data/exports/<时间戳>）
+python main.py export-full [dir]    # 全库打包 zip：原文 .md + 结构 + manifest（解压即用）
+python main.py mcp                  # MCP 只读服务（stdio），外部 AI 客户端调用本知识库
 python main.py ask "问题"            # AI 管家 RAG 问答
 python main.py curator "dry wikilinks"       # 双链生成 dry-run 预扫描（只报数不写库）
 python main.py curator "scan topic"          # 全库分类校准扫描（纯查缓存）→ 审阅队列
@@ -245,6 +249,8 @@ ai-kms/
 │  │  ├─ engine.py           # 节点/边/孤立点/记忆权重（倒排语义边 + epoch 缓存）
 │  │  └─ search.py           # FTS5/BM25 检索 + 相关推荐（预留语义向量）
 │  ├─ curator.py             # ★知识策展人：双链生成 / 分类校准 / 建议应用（纯规则离线可用）
+│  ├─ export.py              # ★结构导出：JSONL/graph.json/manifest + 全库 zip（确定性排序）
+│  ├─ mcp_server.py          # ★MCP 只读服务：KmsTools 纯函数 + MCPServer 薄壳（stdio·ro 直连）
 │  ├─ generative/            # 生成层（多模型）
 │  │  ├─ provider.py         # mode 驱动：auto/claude/openai/ollama/mock，保存即生效
 │  │  └─ tasks.py            # 摘要 / QA(RAG+挂载置顶) / 润色 / 矛盾检测
@@ -256,7 +262,7 @@ ai-kms/
 │     ├─ fts.py              # ★分词单一事实源（索引/查询共用，jieba 预分词）
 │     └─ sqlite_db.py        # SQLite 8 表 + FTS5 虚表 + suggestions 队列 + epoch
 ├─ config/settings.py        # 路径 / 模型 / 开关 + .env 写回
-├─ tests/                    # 75 例：管线/导入/FTS/建议队列/图谱/检索/策展×2/设置
+├─ tests/                    # 108 例：管线/导入/FTS/建议队列/图谱/检索/策展×2/设置/只读/导出/MCP
 ├─ data/                     # 运行时（vault / kms.db / dropbox）
 ├─ main.py                   # CLI + GUI 入口
 ├─ requirements.txt
@@ -277,6 +283,8 @@ ai-kms/
 | `core/graph/engine.py` | 图谱引擎：双链 + 语义补链（倒排建边）+ 孤立点 + 记忆权重 + epoch 缓存 |
 | `core/graph/search.py` | FTS5/BM25 检索 + 相关推荐（fts 不可用时自动降级旧路径） |
 | `core/curator.py` | **知识策展人**：双链生成、分类校准（纯缓存）、建议应用（快照+重索引） |
+| `core/export.py` | 结构导出：派生资产 JSONL + graph.json + manifest，全库打包 zip |
+| `core/mcp_server.py` | MCP 只读服务：search/atoms/classify_hint/graph_neighbors 四工具，ro 直连主库 |
 | `core/storage/fts.py` | 分词单一事实源——索引与查询必须同词表（jieba 预分词 → FTS5 unicode61） |
 | `core/generative/provider.py` | 生成层多模型，Claude → OpenAI 兼容 → Ollama → Mock 降级 |
 | `core/generative/tasks.py` | 摘要 / RAG 问答 / 润色 / 矛盾检测 |
@@ -311,10 +319,47 @@ cp .env.example .env
 
 ---
 
+## 资产开放：导出 与 外部 AI 调用（MCP）
+
+> "一次解析、原子沉淀、终身复用"——沉淀出的资产也要**搬得走、被调用**。
+
+**结构导出**（GUI 工具栏「导出」或 CLI，两种模式）：
+
+- `structure`：`manifest.json` + `structure/{files,atoms,links,classifications,categories,suggestions}.jsonl` + `graph.json`——AI 读出来的派生数据（原子/分类/双链/图谱/审阅队列）全量导出；
+- `full`：再捆绑 vault 全部 `.md` 原文打成单个 zip（内部布局与目录模式逐字一致，解压即用）；
+- 约定：path 一律 vault 相对 POSIX；自增 id 不进资产；排序确定——同一库两次导出逐字一致；`mcp`/`mcp.log` 之外零新依赖。
+
+**MCP 只读服务**（`python main.py mcp`，stdio）——外部 AI（Claude Code / Cursor / 任意 MCP 客户端）把知识库当便宜工具调：查询只命中缓存原子、**不重读原文**，返回体小、不烧 API：
+
+| 工具 | 职责 |
+|---|---|
+| `kms.search` | FTS5/BM25 检索（未灌词自动降级旧路径），返回 path/title/topic/score/backlinks/neighbors |
+| `kms.atoms` | 某笔记的缓存原子按 kind 分组（keyword/claim/tag/topic + 权重） |
+| `kms.classify_hint` | 分类缓存查询——**纯缓存，绝不触发任何 AI 分类/API 调用** |
+| `kms.graph_neighbors` | 图谱直接邻居（双向，含对方 title/topic） |
+
+接入（绝对路径，与客户端 cwd 无关）：
+
+```bash
+claude mcp add kms -- python "E:/claude code/AI-native/ai-kms/main.py" mcp
+```
+
+`.mcp.json` / Cursor `~/.cursor/mcp.json` 同构：
+
+```json
+{ "mcpServers": { "kms": {
+    "command": "python",
+    "args": ["E:/claude code/AI-native/ai-kms/main.py", "mcp"] } } }
+```
+
+**只读纪律**：MCP 进程以 `mode=ro` 直连主库——GUI 开着也能同时读写互不阻塞（WAL）；本期不开放任何写接口，AI 写回仍只走库内"快照 + 审阅队列"。调用审计在 `data/logs/mcp.log`。注意：graph 缓存存活于 MCP 进程内，主库有大量更新后重启该进程即可看到最新图谱形态（其余查询实时读已提交快照）。
+
+---
+
 ## 测试
 
 ```bash
-python -m pytest tests -q            # 75 例
+python -m pytest tests -q            # 108 例
 ```
 
 | 测试文件 | 覆盖面 |
@@ -326,8 +371,9 @@ python -m pytest tests -q            # 75 例
 | `test_graph_engine.py` / `test_search_router.py` | 倒排建边等价·桶封顶·epoch 缓存 / 检索结构·分类器修复 |
 | `test_curator_wikilinks.py` / `test_curator_topic.py` | 双链生成两档·围栏保护·stale 防护 / 纯缓存校准·**扫描零读盘断言** |
 | `test_settings_env.py` | .env 保注释改写 / Provider mode 矩阵 |
+| `test_readonly_store.py` / `test_export.py` / `test_mcp_tools.py` | 只读直连·写守卫·裸 SQL 契约 / 导出口径·容错·zip 布局 / MCP 四工具 + 服务薄壳冒烟 |
 
-当前状态：**75/75 通过**。3000 篇规模实测：检索 p95 ≈ 23ms、图谱冷构建 0.15s、全库分类校准（纯缓存）约 7s。
+当前状态：**108/108 通过**。3000 篇规模实测：检索 p95 ≈ 23ms、图谱冷构建 0.15s、全库分类校准（纯缓存）约 7s。
 
 ---
 
@@ -341,7 +387,7 @@ python -m pytest tests -q            # 75 例
 | 生成层 | Claude API / OpenAI 兼容（DeepSeek·Kimi·vLLM 等）/ 本地 Ollama / Mock，mode 驱动、保存即生效 |
 | 检索 | FTS5 bm25（jieba 预分词，索引/查询同源）+ 图谱倒排建边 + epoch 缓存（预留 sentence-transformers / sqlite-vss） |
 | 监听 | watchdog |
-| 依赖 | 仅 `PySide6 · watchdog · requests · python-dotenv · jieba` |
+| 依赖 | 仅 `PySide6 · watchdog · requests · python-dotenv · jieba`（`mcp` 仅 MCP 服务命令需要） |
 
 ---
 
@@ -353,7 +399,8 @@ python -m pytest tests -q            # 75 例
 - [x] **阶段 5** —— 全区域可操作（编辑/新建/重命名/删除/回滚/相关笔记跳转）
 - [x] **阶段 6** —— 收录增强（导入文件夹 / 树拖拽 / 知识节点簇图标 / 双链预览渲染）
 - [x] **阶段 7** —— AI 管家完善一期（FTS5 地基 / 图谱性能 / 审阅队列 / 双链生成 / 分类校准 / 挂载 / 设置面板）
-- [ ] 阶段 8（下一批）—— 发现关联（全库相似边）、批量润色整理、挂载拖拽、真实 LLM 接入调优
+- [x] **阶段 8** —— 资产开放一期：结构导出 + MCP 只读服务（判断层资产对外复用，写接口不开放）
+- [ ] 阶段 9（下一批）—— 发现关联（全库相似边）、批量润色整理、挂载拖拽、真实 LLM 接入调优
 - [ ] 后续 —— 向量语义检索（sentence-transformers / sqlite-vss）、知识复盘 Agent、多 Vault 同步、外部改 vault 文件的双向同步
 
 ---

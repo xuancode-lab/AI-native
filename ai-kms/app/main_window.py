@@ -669,6 +669,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QShortcut
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_note)
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self._new_note)
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_note)
 
         # 中间：工作区（堆叠）
         self.workspace = QStackedWidget()
@@ -862,13 +863,18 @@ class MainWindow(QMainWindow):
         self._btn_watch.setCheckable(True)
         self._btn_watch.setChecked(True)
         tb.addSeparator()
-        _btn(" 搜索", "搜索知识库", self._focus_search, "search")
         _btn(" 审阅", "打开审阅队列", self.open_review, "review")
         _btn(" 设置", "AI Provider / 密钥 / 索引维护", self._settings_dialog, "settings")
-        # 搜索：防抖定时器 + 框下结果浮层
+        self._btn_export = _btn(" 导出", "导出结构层 JSONL / 全库打包 ZIP（数据不锁定，资产可搬走）",
+                                self._export_menu)
+        tb.addSeparator()
+        # 搜索图标紧贴搜索框（此前隔了审阅/设置/导出三个按钮）
+        _btn(" 搜索", "聚焦搜索框并搜索", self._focus_search, "search")
+        # 搜索：防抖定时器 + 框下结果浮层。
+        # 防抖 450ms：中文输入法组字停顿不会误触发；回车 = 立即检索。
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(200)
+        self._search_timer.setInterval(450)
         self._search_timer.timeout.connect(self._do_search)
         self._search_bar = QLineEdit()
         self._search_bar.setPlaceholderText("搜索笔记… Enter 打开")
@@ -880,7 +886,13 @@ class MainWindow(QMainWindow):
 
         self._search_popup = QListWidget()
         self._search_popup.setObjectName("searchPopup")
-        self._search_popup.setWindowFlags(Qt.WindowType.Popup)
+        # ⚠ 不用 Qt.Popup：Popup 会抓取鼠标+键盘（IME 组字被打断、搜索框点不动）。
+        # ToolTip 型窗口不吃键盘、不抓鼠标：打字/点框都不受影响；
+        # 点外部/Esc/移动窗口的收起逻辑在 eventFilter 里手动做。
+        self._search_popup.setWindowFlags(
+            Qt.WindowType.ToolTip
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus)
         # 弹出时不抢焦点：继续打字仍进搜索框（增量搜索）
         self._search_popup.setAttribute(
             Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -909,7 +921,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(4)
 
-        # 顶栏：新建 / 编辑·预览切换 / 保存 / 路径提示
+        # 顶栏：新建 / 编辑·预览切换 / 保存 / 关闭 / 路径提示
         bar = QHBoxLayout()
         self._note_new_btn = QPushButton("＋ 新建笔记")
         self._note_new_btn.clicked.connect(self._new_note)
@@ -919,11 +931,16 @@ class MainWindow(QMainWindow):
         self._note_save_btn = QPushButton("保存 (Ctrl+S)")
         self._note_save_btn.clicked.connect(self._save_note)
         self._note_save_btn.setEnabled(False)
+        self._note_close_btn = QPushButton("✕ 关闭")
+        self._note_close_btn.setToolTip("关闭当前笔记 (Ctrl+W)，未保存改动会提示")
+        self._note_close_btn.clicked.connect(self._close_note)
+        self._note_close_btn.setEnabled(False)
         self._note_path_lbl = QLabel("（未打开笔记）")
         self._note_path_lbl.setStyleSheet("color:#5f6368;")
         bar.addWidget(self._note_new_btn)
         bar.addWidget(self._note_edit_btn)
         bar.addWidget(self._note_save_btn)
+        bar.addWidget(self._note_close_btn)
         bar.addStretch(1)
         bar.addWidget(self._note_path_lbl)
         lay.addLayout(bar)
@@ -976,6 +993,11 @@ class MainWindow(QMainWindow):
                         f'style="color:{color};text-decoration:{deco};">'
                         f'{alias}</a>')
             parts[i] = _WIKI_FULL_RE.sub(repl, parts[i])
+            # Obsidian 式换行：源码单换行 → 行尾补两空格变硬换行。
+            # CommonMark 默认把单换行并入同一段——我们的笔记段间无空行，
+            # 不处理的话预览会把整段正文并成一行，"看起来完全没渲染"。
+            # 空行仍是段落分隔（行内只有空格=空行），列表/标题行为不变。
+            parts[i] = re.sub(r"[ \t]*$", "  ", parts[i], flags=re.M)
         return "".join(parts)
 
     def _on_preview_anchor(self, url):
@@ -1011,6 +1033,50 @@ class MainWindow(QMainWindow):
         else:
             self._note_stack.setCurrentIndex(0)
             self._note_save_btn.setEnabled(False)
+
+    def _close_note(self):
+        """关闭当前笔记：未保存改动先提示；清预览/编辑/属性栏/版本历史。"""
+        rel = self._current_note()
+        if not rel:
+            self.statusBar().showMessage("当前没有打开的笔记", 2000)
+            return
+        # 编辑态且有未保存改动 → 提示保存/放弃
+        if self._note_edit_btn.isChecked():
+            if self.notes_editor.toPlainText() != self.vault.read_note(rel):
+                answer = QMessageBox.question(
+                    self, "关闭笔记",
+                    f"《{rel}》有未保存的修改，先保存吗？",
+                    QMessageBox.StandardButton.Save
+                    | QMessageBox.StandardButton.Discard
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Save)
+                if answer == QMessageBox.StandardButton.Cancel:
+                    return
+                if answer == QMessageBox.StandardButton.Save:
+                    self._save_note()
+                    if self._current_note() == rel and \
+                            self.notes_editor.toPlainText() != self.vault.read_note(rel):
+                        return  # 保存失败（弹窗已提示），不关闭
+        self._clear_note_views()
+        self.statusBar().showMessage(f"已关闭：{rel}", 3000)
+        self._append_log(f"✕ 关闭：{rel}")
+
+    def _clear_note_views(self):
+        """关闭/删除后的统一清理：退编辑态 + 清预览/属性栏/版本历史。"""
+        if self._note_edit_btn.isChecked():
+            self._note_edit_btn.setChecked(False)  # 先退编辑态（stack 正常回预览）
+        self._cur_note = None
+        self.notes_preview.setPlainText("")
+        self.notes_editor.setPlainText("")
+        self._note_save_btn.setEnabled(False)
+        self._note_close_btn.setEnabled(False)
+        self._note_path_lbl.setText("（未打开笔记）")
+        # 右栏属性 + 底部版本历史一并清空
+        self._props_title.setText("（未选择笔记）")
+        self._props_info.clear()
+        self._props_atoms.clear()
+        self._props_related.clear()
+        self._snap_list.clear()
 
     def _save_note(self):
         rel = self._current_note()
@@ -1440,9 +1506,7 @@ class MainWindow(QMainWindow):
             full.unlink()
         self.store.delete_file(rel)
         if self._current_note() == rel:
-            self._cur_note = None
-            self.notes_preview.clear()
-            self._note_path_lbl.setText("（未打开笔记）")
+            self._clear_note_views()   # 直接清理视图（跳过未保存提示：文件已删）
         self._append_log(f"🗑 删除：{rel}")
         self._refresh_tree()
         self._refresh_ai_notes()
@@ -1460,6 +1524,7 @@ class MainWindow(QMainWindow):
             self._note_edit_btn.setChecked(False)
         self._note_stack.setCurrentIndex(0)
         self._note_save_btn.setEnabled(False)
+        self._note_close_btn.setEnabled(True)
         self._note_path_lbl.setText(rel_path)
         self.workspace.setCurrentIndex(0)
 
@@ -1536,6 +1601,38 @@ class MainWindow(QMainWindow):
                 self._refresh_ai_notes()
             else:
                 self._append_log(f" 未收录：{res.get('reason')}")
+
+    # ---------- 结构导出（工具栏按钮，与 CLI export 共用 core/export.py） ----------
+    def _export_menu(self):
+        menu = QMenu(self)
+        menu.addAction("导出结构层（JSONL + 图谱）",
+                       lambda: self._export_pick("structure"))
+        menu.addAction("全库打包（ZIP，含全部笔记原文）",
+                       lambda: self._export_pick("full"))
+        menu.exec(QCursor.pos())
+
+    def _export_pick(self, mode):
+        from PySide6.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(self, "选择导出目录")
+        if not d:
+            return
+        self._run_export(Path(d), mode)
+
+    def _run_export(self, out, mode):
+        """同步执行即可：结构导出万篇秒级，全库 zip 几千篇 2~5s，可接受。"""
+        from core.export import export_full, export_structure
+        try:
+            if mode == "full":
+                zp = export_full(self.store, self.vault, out)
+                msg = f"导出完成 · 全库打包 {zp.name}（{zp.stat().st_size // 1024} KB）"
+            else:
+                m = export_structure(self.store, self.vault, out)
+                c = m["counts"]
+                msg = f"导出完成 · {c['files']} 篇 · {c['atoms']} 原子 → {out / 'structure'}"
+            self.statusBar().showMessage(msg, 6000)
+            self._append_log(f"📦 {msg}")
+        except Exception as e:
+            self.statusBar().showMessage(f"导出失败：{e}", 6000)
 
     # ---------- 批量导入（工具栏按钮 / 树拖拽 共用） ----------
     def _import_folder_dialog(self):
@@ -2413,6 +2510,27 @@ class MainWindow(QMainWindow):
         （分割条双箭头 / 文本 IBeam / 标签箭头）被改坏或卡死的问题。
         """
         et = event.type()
+
+        # ---- 搜索浮层收起（ToolTip 窗口不自动关，手动管理）----
+        # 放在 in_window 守卫之前：↓ 后焦点在浮层上，Esc/点击都要能收到。
+        # try 守卫：关窗清理期 C++ 对象可能先亡（libshiboken RuntimeError），跳过即可。
+        pop = getattr(self, "_search_popup", None)
+        try:
+            if pop is not None and pop.isVisible():
+                if et == QEvent.Type.MouseButtonPress:
+                    gp = event.globalPosition().toPoint()
+                    if (not pop.geometry().contains(gp)
+                            and not self._search_bar.rect().contains(
+                                self._search_bar.mapFromGlobal(gp))):
+                        pop.hide()      # 点外部 → 收起，事件不吞（点哪算哪）
+                elif et == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+                    pop.hide()
+                    return True         # Esc 只关浮层
+                elif et in (QEvent.Type.Move, QEvent.Type.Resize) and obj is self:
+                    pop.hide()          # 主窗口动了，浮层位置作废
+        except RuntimeError:
+            pop = None                  # 浮层已析构（清理阶段），后续不再触碰
+
         in_window = (obj is self) or (
             isinstance(obj, QWidget) and obj.window() is self)
         if not in_window:

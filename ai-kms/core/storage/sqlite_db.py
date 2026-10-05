@@ -15,14 +15,35 @@ from core.storage.fts import tokenize
 
 
 class SQLiteStore:
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False):
         self.db_path = Path(db_path) if db_path else settings.DB_PATH
+        self._read_only = read_only
+        self._epoch = 0          # 写路径计数器：graph 缓存失效的唯一依据（GIL 下 int 自增原子）
+        if read_only:
+            # 只读连接（MCP/导出场景）：绝不跑 _init_schema——mode=ro 下 CREATE TABLE 必报错。
+            if not self.db_path.exists():
+                raise FileNotFoundError(
+                    f"知识库数据库不存在：{self.db_path}（请先在 GUI 入库或运行 python main.py reindex）")
+            # 路径可能含空格：as_uri() 自带百分号编码，不能裸拼 file: + 原路径。
+            self.conn = sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=ro",
+                uri=True, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            # 不设 journal_mode PRAGMA（该动作需写权限；主库已是 WAL，只读方直接读已提交快照）。
+            self.fts_ok = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notes_fts'"
+            ).fetchone() is not None
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL;")
-        self._epoch = 0          # 写路径计数器：graph 缓存失效的唯一依据（GIL 下 int 自增原子）
         self._init_schema()
+
+    def _require_write(self) -> None:
+        """全部公开写方法首行守卫：只读模式显式报错（比 sqlite OperationalError 可读、可单测）。"""
+        if self._read_only:
+            raise RuntimeError("只读模式禁止写入知识库")
 
     @property
     def epoch(self) -> int:
@@ -119,6 +140,7 @@ class SQLiteStore:
     def upsert_file(self, path: str, title: str, topic: str = "未分类",
                     type_: str = "note", priority: int = 0,
                     dedup_key: str | None = None, mtime: float = 0.0) -> None:
+        self._require_write()
         self.conn.execute(
             """INSERT INTO vault_files(path,title,topic,type,priority,dedup_key,mtime)
                VALUES(?,?,?,?,?,?,?)
@@ -147,6 +169,7 @@ class SQLiteStore:
     # ---- 分类（分类层 taxonomy 的持久化扩展，文件夹=分类）----
     def add_category(self, name: str, keywords: list[str] | None = None) -> None:
         """新增自定义分类；keywords = 触发词（命中即归入该 topic）。"""
+        self._require_write()
         self.conn.execute(
             "INSERT INTO categories(name, keywords) VALUES(?, ?) "
             "ON CONFLICT(name) DO UPDATE SET keywords=excluded.keywords",
@@ -162,6 +185,7 @@ class SQLiteStore:
                 for r in rows]
 
     def drop_category(self, name: str) -> None:
+        self._require_write()
         self.conn.execute("DELETE FROM categories WHERE name=?", (name,))
         self.conn.commit()
 
@@ -172,6 +196,7 @@ class SQLiteStore:
     # ---- 记忆权重（GBrain 思想：按使用/浏览频次迭代权重）----
     def touch_file(self, path: str) -> None:
         """记录一次访问，提升该文件与其原子的记忆权重。"""
+        self._require_write()
         self.conn.execute(
             "UPDATE vault_files SET usage_count = usage_count + 1 WHERE path=?",
             (path,),
@@ -186,6 +211,7 @@ class SQLiteStore:
     # ---- 阶段5：编辑/重命名/删除 的索引维护 ----
     def update_edit_meta(self, path: str, title: str, dedup_key: str) -> None:
         """人工编辑保存后：更新标题、内容指纹、mtime。"""
+        self._require_write()
         import time as _time
         self.conn.execute(
             "UPDATE vault_files SET title=?, dedup_key=?, mtime=? WHERE path=?",
@@ -195,17 +221,20 @@ class SQLiteStore:
         self._bump()
 
     def clear_atoms(self, path: str) -> None:
+        self._require_write()
         self.conn.execute("DELETE FROM atoms WHERE file_path=?", (path,))
         self.conn.commit()
         self._bump()
 
     def clear_links_from(self, path: str) -> None:
+        self._require_write()
         self.conn.execute("DELETE FROM links WHERE from_path=?", (path,))
         self.conn.commit()
         self._bump()
 
     def rename_path(self, old: str, new: str) -> None:
         """重命名后同步所有关联表的路径引用。"""
+        self._require_write()
         tables = [("vault_files", "path"), ("atoms", "file_path"),
                   ("links", "from_path"), ("classifications", "file_path"),
                   ("snapshots", "file_path"), ("suggestions", "file_path")]
@@ -228,6 +257,7 @@ class SQLiteStore:
 
     def delete_file(self, path: str) -> None:
         """删除笔记：清理其在所有表中的记录，失效其相关建议。"""
+        self._require_write()
         tables = [("vault_files", "path"), ("atoms", "file_path"),
                   ("links", "from_path"), ("classifications", "file_path"),
                   ("snapshots", "file_path")]
@@ -253,6 +283,7 @@ class SQLiteStore:
 
     # ---- atoms ----
     def add_atoms(self, file_path: str, atoms: list[dict]) -> int:
+        self._require_write()
         added = 0
         for a in atoms:
             kind, value, weight = a["kind"], a["value"], a.get("weight", 1.0)
@@ -282,6 +313,7 @@ class SQLiteStore:
     # ---- links ----
     def add_link(self, from_path: str, to_target: str,
                  kind: str = "wikilink") -> None:
+        self._require_write()
         self.conn.execute(
             "INSERT OR IGNORE INTO links(from_path,to_target,kind) VALUES(?,?,?)",
             (from_path, to_target, kind),
@@ -290,6 +322,7 @@ class SQLiteStore:
         self._bump()
 
     def delete_link(self, from_path: str, to_target: str) -> None:
+        self._require_write()
         self.conn.execute(
             "DELETE FROM links WHERE from_path=? AND to_target=?",
             (from_path, to_target),
@@ -309,6 +342,7 @@ class SQLiteStore:
 
     def remove_atoms_kind(self, file_path: str, kind: str) -> None:
         """删除某笔记指定类型的原子（分类校准时换 topic 原子用）。"""
+        self._require_write()
         self.conn.execute(
             "DELETE FROM atoms WHERE file_path=? AND kind=?", (file_path, kind))
         self.conn.commit()
@@ -317,6 +351,7 @@ class SQLiteStore:
     # ---- FTS5（notes_fts：path 不索引，tokens=分词后空格文本）----
     def index_note_tokens(self, rel: str, text: str) -> None:
         """delete-then-insert，幂等；fts_ok=False 时空操作。"""
+        self._require_write()
         if not self.fts_ok:
             return
         self.conn.execute("DELETE FROM notes_fts WHERE path=?", (rel,))
@@ -325,6 +360,7 @@ class SQLiteStore:
         self.conn.commit()
 
     def delete_note_tokens(self, rel: str) -> None:
+        self._require_write()
         if not self.fts_ok:
             return
         self.conn.execute("DELETE FROM notes_fts WHERE path=?", (rel,))
@@ -363,6 +399,7 @@ class SQLiteStore:
     def add_suggestions(self, rows: list[dict]) -> int:
         """批量插入。冲突(kind,file_path,target)时：pending 行刷新 payload/confidence，
         已处理(applied/skipped/obsolete)行不动——重扫不会复活用户已跳过的建议。"""
+        self._require_write()
         n = 0
         for r in rows:
             cur = self.conn.execute(
@@ -433,6 +470,7 @@ class SQLiteStore:
         return d
 
     def resolve_suggestion(self, sid: int, status: str) -> None:
+        self._require_write()
         self.conn.execute(
             "UPDATE suggestions SET status=?, resolved_at=datetime('now','localtime') "
             "WHERE id=?", (status, sid))
@@ -448,6 +486,7 @@ class SQLiteStore:
     def mark_obsolete(self, file_path: str | None = None,
                       target: str | None = None) -> None:
         """按路径/目标失效 pending 建议（apply 指纹过期、重读校准后清理用）。"""
+        self._require_write()
         conds, args = [], []
         if file_path:
             conds.append("file_path=?")
@@ -464,6 +503,7 @@ class SQLiteStore:
         self.conn.commit()
 
     def purge_resolved(self) -> int:
+        self._require_write()
         cur = self.conn.execute(
             "DELETE FROM suggestions WHERE status IN('applied','skipped','obsolete')")
         self.conn.commit()
@@ -471,6 +511,7 @@ class SQLiteStore:
 
     # ---- classifications ----
     def save_classification(self, file_path: str, c: dict) -> None:
+        self._require_write()
         self.conn.execute(
             """INSERT INTO classifications(file_path,topic,type,priority,verdict)
                VALUES(?,?,?,?,?)""",
@@ -488,6 +529,7 @@ class SQLiteStore:
 
     # ---- snapshots ----
     def snapshot(self, file_path: str, content: str, reason: str) -> None:
+        self._require_write()
         self.conn.execute(
             "INSERT INTO snapshots(file_path,content,reason) VALUES(?,?,?)",
             (file_path, content, reason),
@@ -496,6 +538,7 @@ class SQLiteStore:
 
     # ---- logs ----
     def log(self, level: str, module: str, message: str) -> None:
+        self._require_write()
         try:
             self.conn.execute(
                 "INSERT INTO logs(level,module,message) VALUES(?,?,?)",
@@ -504,6 +547,82 @@ class SQLiteStore:
             self.conn.commit()
         except Exception:
             pass
+
+    # ---- 导出专用只读查询（供 core/export.py；path 均为 vault 相对 POSIX 路径）----
+    def iter_atoms(self, batch: int = 2000):
+        """按 (file_path,kind,value) 键集分页流式导出全部原子：内存恒定 + 顺序确定。"""
+        last: tuple[str, str, str] | None = None
+        while True:
+            if last is None:
+                rows = self.conn.execute(
+                    "SELECT file_path,kind,value,weight FROM atoms "
+                    "ORDER BY file_path,kind,value LIMIT ?", (batch,)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT file_path,kind,value,weight FROM atoms "
+                    "WHERE (file_path,kind,value) > (?,?,?) "
+                    "ORDER BY file_path,kind,value LIMIT ?",
+                    (*last, batch)).fetchall()
+            if not rows:
+                return
+            for r in rows:
+                yield dict(r)
+            last = (rows[-1]["file_path"], rows[-1]["kind"], rows[-1]["value"])
+
+    def dump_links(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT from_path,to_target,kind FROM links "
+            "ORDER BY from_path,to_target").fetchall()]
+
+    def dump_classifications(self) -> list[dict]:
+        """每文件只导最新一条（id 最大）；verdict 坏 JSON 保留 raw，绝不抛。"""
+        rows = self.conn.execute(
+            """SELECT c.file_path,c.topic,c.type,c.priority,c.verdict,c.classified_at
+               FROM classifications c
+               JOIN (SELECT file_path, MAX(id) mid FROM classifications
+                     GROUP BY file_path) t ON c.id = t.mid
+               ORDER BY c.file_path""").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["verdict"] = json.loads(d.get("verdict") or "{}")
+            except json.JSONDecodeError:
+                d["verdict"] = {"verdict_raw": d.get("verdict")}
+            out.append(d)
+        return out
+
+    def dump_suggestions(self) -> list[dict]:
+        """全部状态（pending/applied/skipped/obsolete）——审阅队列全貌；id 不导出（跨库无意义）。"""
+        rows = self.conn.execute(
+            """SELECT kind,file_path,target,payload,confidence,status,
+                      created_at,resolved_at
+               FROM suggestions ORDER BY kind,file_path,target""").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(d.get("payload") or "{}")
+            except json.JSONDecodeError:
+                d["payload"] = {"payload_raw": d.get("payload")}
+            out.append(d)
+        return out
+
+    def table_counts(self) -> dict[str, int]:
+        """manifest 用的自然计数（各表全量行数；classifications 是全历史，
+        导出文件"每文件最新一条"的行数 ≤ 此值属预期，见 core/export.py）。"""
+        def _n(sql: str) -> int:
+            return self.conn.execute(sql).fetchone()[0]
+        counts = {
+            "files": _n("SELECT COUNT(*) FROM vault_files"),
+            "atoms": _n("SELECT COUNT(*) FROM atoms"),
+            "links": _n("SELECT COUNT(*) FROM links"),
+            "classifications": _n("SELECT COUNT(*) FROM classifications"),
+            "categories": _n("SELECT COUNT(*) FROM categories"),
+            "suggestions": _n("SELECT COUNT(*) FROM suggestions"),
+            "fts": _n("SELECT COUNT(*) FROM notes_fts") if self.fts_ok else 0,
+        }
+        return counts
 
     def close(self) -> None:
         self.conn.close()

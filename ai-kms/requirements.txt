@@ -4,3 +4,4 @@ watchdog>=3.0.0         # 文件夹监听自动收录
 requests>=2.31.0        # Claude API / 分类器 provider 网络
 python-dotenv>=1.0.0    # 密钥/配置注入
 jieba>=0.42.1           # 中文分词（BM25/关键词/去重指纹）
+mcp>=2.3,<3             # MCP 只读服务（官方 SDK，MCPServer/stdio）；仅 `python main.py mcp` 需要
