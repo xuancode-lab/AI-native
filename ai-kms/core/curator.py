@@ -1,11 +1,12 @@
-"""知识策展人（AI 管家一期·判断类模式）：双链生成 / 分类校准 / 建议应用。
+"""知识策展人（AI 管家·判断类模式）：双链生成 / 分类校准 / 发现关联 / 建议应用。
 
 设计约束（用户拍板）：
   - 纯规则驱动，Mock/无密钥下即产出真实可用的建议；LLM 增强只走 enhancer 接口，一期 None。
   - 分类校准只查缓存（classifications.verdict + atoms 关键词），**零 read_note**；
     缓存证据不足者标 needs_reread，由显式动作 reread_recalibrate 经用户同意后重读。
   - 建议全部落 suggestions 表走人工审阅队列；应用一律经 SnapshotManager 先快照后写。
-  - 双链的 target 一律用文件 stem（=graph title_index 首键），不用 H1，避免双标题源分歧。
+  - 双链/关联的 target 一律用文件 stem（=graph title_index 首键），不用 H1，避免双标题源分歧。
+  - 发现关联采纳 = 写进笔记成真链接（复用 wikilink 段追加路径，reindex 后图谱自然升实线）。
 
 suggestion payload schema（唯一定义处）：
   kind="wikilink":
@@ -19,6 +20,12 @@ suggestion payload schema（唯一定义处）：
   kind="topic":
     { now_topic, new_topic, topic_hits, extra_hits, margin,
       needs_reread: bool, evidence: "cache"|"cache+atoms"|"reread" }
+  kind="edge"（发现关联；payload 结构兼容 wikilink 的 section 模式，复用 _apply_wikilink）:
+    { source: "edge_discovery", target_title(=对面 stem), target_path,
+      content_fp(被改侧), insert_at: null, anchor: null, safe: false,
+      shared_keywords: [..], title_shared: int,
+      tier: "dashed"(虚线升实线)|"rescue"(孤立救援)|"library"(全库单词对),
+      deg_from, deg_to }                           # pair 两端在图中的度数
 """
 from __future__ import annotations
 
@@ -29,11 +36,15 @@ from collections import Counter
 from itertools import combinations
 
 from core.classify.rules import TOPIC_RULES
+from core.graph.engine import GraphEngine
 from core.storage.fts import tokenize
 from core.storage.vault import Vault, slugify
 from core.aipilot.snapshot import SnapshotManager
 
 MAX_SUGG_PER_NOTE = 5          # 单篇一次扫描的建议上限
+MAX_EDGE_PER_NODE = 3          # 发现关联：每节点最多建议数（两端都计数）
+MAX_EDGE_PAIRS = 500           # 发现关联：单次扫描全局建议上限
+_EDGE_HUB_CAP = 60             # 关键词波及文件数超此值视为 hub 词，不计入 shared（对齐 engine）
 
 
 class Curator:
@@ -250,6 +261,166 @@ class Curator:
                 changed += 1
         return {"done": len(rels), "changed": changed}
 
+    # ================= 发现关联（edge discovery） =================
+    def edges_dry_run(self, scope: dict, all_pairs: bool = False) -> dict:
+        """预扫描报数：纯算不落库、不读笔记文件。"""
+        pairs = self.edge_candidates(scope, all_pairs)
+        g = GraphEngine(self.store).build()
+        in_scope = set(self.resolve_scope(scope))
+        iso = sum(1 for p in g["isolated"] if p in in_scope)
+        return {"will_pairs": len(pairs), "isolated": iso,
+                "pending": self.store.count_pending("edge")}
+
+    def edge_candidates(self, scope: dict, all_pairs: bool = False) -> list[dict]:
+        """生成→门槛→评分→排序→cap 的纯函数。pair 规则见模块 docstring。
+
+        默认产出：tier1 dashed（shared≥2，即图谱已有虚线、可升实线）与
+        tier2 rescue（一端孤立、须有标题交集或同主题背书）；
+        all_pairs=True 时追加 tier2b library（两端非孤立、仅共享 1 词）。
+        """
+        paths = set(self.resolve_scope(scope))
+        ctx = self._scan_ctx()
+        if not paths:
+            return []
+        g = GraphEngine(self.store).build()
+        deg: Counter = Counter()
+        link_pairs: set = set()
+        for e in g["edges"]:
+            a, b = g["nodes"][e["source"]]["id"], g["nodes"][e["target"]]["id"]
+            deg[a] += 1
+            deg[b] += 1
+            if e["kind"] == "link":
+                link_pairs.add(frozenset((a, b)))
+        topic_of = {f["path"]: f["topic"] for f in self.store.all_files()}
+        # 候选期排除（双向）：applied 任何类型；pending 仅 wikilink（同对已被内容级建议覆盖，
+        # 不再出 edge）。pending edge 不在此排除——留给 commit 期防反向、同向走
+        # add_suggestions 的 DO UPDATE 刷新语义（重扫让置信度保持新鲜）。
+        sugg_pairs = set()
+        for r in self.store.conn.execute(
+                "SELECT kind, file_path, target, status FROM suggestions"
+                " WHERE status IN ('pending','applied')"):
+            q = ctx.title_of.get(r["target"])
+            if q is None:
+                continue
+            if r["status"] == "applied" or r["kind"] != "edge":
+                sugg_pairs.add(frozenset((r["file_path"], q)))
+        # 批量取 scope 内关键词原子，查 ctx 倒排聚 pair（hub 词整桶跳过）
+        kws_by_file: dict[str, list] = {}
+        for r in self.store.conn.execute(
+                "SELECT file_path, value FROM atoms WHERE kind='keyword'"):
+            if r["file_path"] in paths:
+                kws_by_file.setdefault(r["file_path"], []).append(r["value"])
+        shared_kw: dict = {}
+        for rel, kws in kws_by_file.items():
+            for kw in kws:
+                peers = ctx.kw_to_paths.get(kw, ())
+                if len(peers) > _EDGE_HUB_CAP:
+                    continue
+                for p in peers:
+                    if p != rel:
+                        shared_kw.setdefault(frozenset((rel, p)), set()).add(kw)
+        out = []
+        for k, kws in shared_kw.items():
+            a, b = sorted(k)
+            sa, sb = ctx.title_of_path.get(a, ""), ctx.title_of_path.get(b, "")
+            if not sa or not sb:
+                continue
+            if sa in ctx.ambiguous or sb in ctx.ambiguous \
+                    or sa in ctx.topic_names or sb in ctx.topic_names:
+                continue
+            if k in link_pairs or k in sugg_pairs:
+                continue
+            shared = len(kws)
+            ts = len(ctx.title_tokens.get(sa, set()) & ctx.title_tokens.get(sb, set()))
+            same_topic = topic_of.get(a) == topic_of.get(b)
+            min_deg = min(deg.get(a, 0), deg.get(b, 0))
+            if shared >= 2:
+                tier = "dashed"
+                conf = min(0.90, 0.55 + 0.10 * shared + 0.15 * ts)
+            elif min_deg == 0 or all_pairs:
+                if shared == 1 and ts == 0 and not same_topic:
+                    continue          # 单词无背书：噪音，宁缺勿滥
+                tier = "rescue" if min_deg == 0 else "library"
+                conf = min(0.65, 0.25 + 0.15 * shared + 0.20 * ts)
+            else:
+                continue
+            out.append({"a": a, "b": b, "shared": shared, "kws": sorted(kws)[:6],
+                        "ts": ts, "tier": tier, "conf": round(conf, 3),
+                        "min_deg": min_deg,
+                        "deg_a": deg.get(a, 0), "deg_b": deg.get(b, 0)})
+        out.sort(key=lambda d: (d["min_deg"], -d["conf"],
+                                -(d["shared"] + 2 * d["ts"]), d["a"], d["b"]))
+        seen: Counter = Counter()
+        res = []
+        for d in out:
+            if seen[d["a"]] >= MAX_EDGE_PER_NODE or seen[d["b"]] >= MAX_EDGE_PER_NODE:
+                continue
+            seen[d["a"]] += 1
+            seen[d["b"]] += 1
+            res.append(d)
+            if len(res) >= MAX_EDGE_PAIRS:
+                break
+        return res
+
+    def edges_scan(self, pairs: list[dict], limit: int = 20) -> dict:
+        """提交批：处理前 limit 个 pair 落 suggestions。契约对齐 wikilinks_scan。
+
+        候选列表是开扫时快照；epoch 变化靠 commit 期三道防线兜底：
+        ① 已有任一向实线 ② pending 同对（含反向翻转） ③ 被改侧 pending≥cap。
+        """
+        batch, rest = pairs[:limit], pairs[limit:]
+        ctx = self._scan_ctx()
+        pend = self.store.conn.execute(
+            "SELECT file_path, target FROM suggestions"
+            " WHERE kind='edge' AND status='pending'").fetchall()
+        # pair → 该对中已作为被改侧出现的 pending 行集合：同向放行（刷新），反向跳过
+        pend_pairs: dict = {}
+        pend_cnt = Counter()
+        for r in pend:
+            q = ctx.title_of.get(r["target"])
+            if q:
+                pend_pairs.setdefault(frozenset((r["file_path"], q)), set()) \
+                    .add(r["file_path"])
+            pend_cnt[r["file_path"]] += 1
+        linked = set()
+        for r in self.store.conn.execute("SELECT from_path, to_target FROM links"):
+            p = ctx.title_of.get(r["to_target"])
+            if p:
+                linked.add(frozenset((r["from_path"], p)))
+        rows = []
+        fp_cache: dict = {}
+        for d in batch:
+            a, b = d["a"], d["b"]
+            mod, other = (a, b) if (d["deg_a"], a) <= (d["deg_b"], b) else (b, a)
+            stem_o = ctx.title_of_path.get(other, _stem(other))
+            k = frozenset((a, b))
+            mods = pend_pairs.get(k)
+            if k in linked:
+                continue
+            if mods and mod not in mods:
+                continue          # 反向 pending 已有 → 跳过；同向放行走刷新
+            if mods is None and pend_cnt.get(mod, 0) >= MAX_EDGE_PER_NODE:
+                continue          # 被改侧 cap 已满不产新行（同向刷新不受限）
+            content = self.vault.read_note(mod)
+            if not content:
+                continue                       # 被改侧已删
+            fp = fp_cache.get(mod)
+            if fp is None:
+                fp = fp_cache[mod] = Vault.make_dedup_key(content)
+            rows.append({"kind": "edge", "file_path": mod, "target": stem_o,
+                         "confidence": d["conf"],
+                         "payload": {"source": "edge_discovery",
+                                     "target_title": stem_o, "target_path": other,
+                                     "content_fp": fp, "insert_at": None,
+                                     "anchor": None, "safe": False,
+                                     "shared_keywords": d["kws"],
+                                     "title_shared": d["ts"], "tier": d["tier"],
+                                     "deg_from": d["deg_a"], "deg_to": d["deg_b"]}})
+            pend_pairs.setdefault(k, set()).add(mod)
+            pend_cnt[mod] += 1                 # 批内自防
+        added = self.store.add_suggestions(rows) if rows else 0
+        return {"scanned": len(batch), "added": added, "remaining": len(rest)}
+
     # ================= 应用（写回） =================
     def apply_suggestion(self, sid: int, target_override: str | None = None) -> dict:
         """采纳一条建议。失败不写库、行保持 pending。
@@ -263,6 +434,9 @@ class Curator:
         try:
             if row["kind"] == "wikilink":
                 return self._apply_wikilink(row, target_override)
+            if row["kind"] == "edge":
+                # 发现关联：payload 兼容 wikilink 段模式，写进笔记成真双链
+                return self._apply_wikilink(row, target_override, reason="关联确认")
             if row["kind"] == "topic":
                 return self._apply_topic(row, target_override)
         except Exception as e:
@@ -270,7 +444,8 @@ class Curator:
             return {"ok": False, "reason": f"error: {e}"}
         return {"ok": False, "reason": "unknown_kind"}
 
-    def _apply_wikilink(self, row: dict, override: str | None) -> dict:
+    def _apply_wikilink(self, row: dict, override: str | None,
+                        reason: str = "AI 双链") -> dict:
         rel, pl = row["file_path"], row["payload"]
         target = (override or pl.get("target_title") or row["target"]).strip()
         content = self.vault.read_note(rel)
@@ -283,7 +458,7 @@ class Curator:
             new_content = content[:pos] + f"[[{target}]]" + content[pos + len(anchor):]
         else:
             new_content = _append_related(content, target)
-        res = self.snapshots.write(rel, new_content, "AI 双链", require_confirm=False)
+        res = self.snapshots.write(rel, new_content, reason, require_confirm=False)
         self.pipe.reindex_note(rel, new_content)
         self.store.resolve_suggestion(row["id"], "applied")
         return {"ok": True, "status": "applied", "snapshot_id": res.get("snapshot_id")}

@@ -39,6 +39,7 @@ try:
         QMessageBox, QGroupBox, QGridLayout, QFormLayout, QTreeView,
         QToolBar, QStackedWidget, QSizePolicy, QHeaderView, QAbstractItemView,
         QTableWidget, QTableWidgetItem, QDoubleSpinBox, QMenu, QAbstractButton,
+        QCheckBox,
     )
     _HAVE_QT = True
 except ImportError:  # pragma: no cover
@@ -1158,7 +1159,7 @@ class MainWindow(QMainWindow):
         zoom_out = QPushButton("－")
         zoom_out.setFixedWidth(36)
         zoom_out.clicked.connect(lambda: self._graph_view.zoom_out())
-        legend = QLabel("  ━=双链  ┄=语义  红=孤立  颜色=主题   ·   滚轮缩放 · 拖空白抓手平移 · 双击打开")
+        legend = QLabel("实线=双链  虚线=语义  红=孤立  颜色=主题 · 滚动缩放 · 拖动平移 · 双击打开")
         legend.setStyleSheet("color: #5f6368;")  # 显式设色，与全局亮色主题一致
         bar.addWidget(refresh); bar.addWidget(zoom_in); bar.addWidget(zoom_out)
         bar.addStretch(1); bar.addWidget(legend)
@@ -1187,7 +1188,7 @@ class MainWindow(QMainWindow):
         ctrl.setSpacing(6)
         self._ai_mode = FlatCombo()
         self._ai_mode.addItems(["问答", "润色笔记", "矛盾检测", "摘要",
-                                "生成双链", "分类校准"])
+                                "生成双链", "分类校准", "发现关联"])
         self._ai_mode.currentIndexChanged.connect(self._ai_mode_changed)
         self._ai_notes = FlatCombo()
         self._refresh_ai_notes()
@@ -1230,6 +1231,9 @@ class MainWindow(QMainWindow):
             lambda i: self._cur_topic.setEnabled(self._cur_scope.currentText() == "指定分类"))
         self._cur_topic = FlatCombo()
         self._cur_topic.setEnabled(False)
+        # 仅"发现关联"模式显示：默认只产孤立救援对与虚线升实线对
+        self._cur_all_pairs = QCheckBox("包含全库对（仅共享1词的普通对）")
+        self._cur_all_pairs.setVisible(False)
         self._btn_cur_dry = QPushButton("预览(dry-run)")
         self._btn_cur_dry.clicked.connect(self._curator_dry_run)
         self._btn_cur_scan = QPushButton("开始扫描")
@@ -1241,6 +1245,7 @@ class MainWindow(QMainWindow):
         self._cur_status = QLabel("")
         self._cur_status.setStyleSheet("color:#5f6368;")
         for x in (QLabel("范围："), self._cur_scope, self._cur_topic,
+                  self._cur_all_pairs,
                   self._btn_cur_dry, self._btn_cur_scan, self._btn_cur_stop,
                   self._cur_status):
             cb.addWidget(x)
@@ -1983,9 +1988,10 @@ class MainWindow(QMainWindow):
 
     def _ai_mode_changed(self, idx):
         mode = self._ai_mode.currentText()
-        curator_mode = mode in ("生成双链", "分类校准")
+        curator_mode = mode in self.CUR_MODE_KIND
         self._curator_bar.setVisible(curator_mode)
         if curator_mode:
+            self._cur_all_pairs.setVisible(mode == "发现关联")
             # 刷新分类选项（与 _new_note 同款全集）
             topics = sorted({f["topic"] for f in self.store.all_files()}
                             | set(TOPIC_RULES)
@@ -1999,9 +2005,10 @@ class MainWindow(QMainWindow):
                 self._cur_topic.setCurrentText(cur)
             self._cur_topic.setEnabled(self._cur_scope.currentText() == "指定分类")
             self._cur_scope.blockSignals(False)
-            hint = ("扫描笔记正文，生成 [[双链]] 建议进审阅队列"
-                    if mode == "生成双链" else
-                    "只查分类缓存重算归属；证据不足项需显式『重读校准』")
+            hint = {"生成双链": "扫描笔记正文，生成 [[双链]] 建议进审阅队列",
+                    "分类校准": "只查分类缓存重算归属；证据不足项需显式『重读校准』",
+                    "发现关联": "扫描关键词共现，为「孤立笔记救援」与「虚线升实线」生成关联建议；"
+                                "采纳即在低连接侧追加 ## 相关 双链"}.get(mode, "")
             self._ai_set_md(f"### {mode}\n{hint}\n\n- **当前笔记**：仅选中/挂载的一篇\n- **指定分类**：该分类下全部\n- **全库**：所有已登记笔记\n\n先「预览(dry-run)」看工作量，再「开始扫描」。建议不会直接改笔记——全部进**审阅队列**逐条确认。")
             return
         if mode == "问答":
@@ -2161,8 +2168,9 @@ class MainWindow(QMainWindow):
                 self._ai_append_md("\n⏭ 已取消写回。")
         self._refresh_tree()
 
-    # ---------- 策展扫描（生成双链 / 分类校准） ----------
-    CUR_MODE_KIND = {"生成双链": "wikilink", "分类校准": "topic"}
+    # ---------- 策展扫描（生成双链 / 分类校准 / 发现关联） ----------
+    CUR_MODE_KIND = {"生成双链": "wikilink", "分类校准": "topic",
+                     "发现关联": "edge"}
 
     def _curator_scope(self) -> dict:
         s = self._cur_scope.currentText()
@@ -2181,29 +2189,46 @@ class MainWindow(QMainWindow):
             self._ai_append_md(
                 f"\n### Dry-run 预览\n将扫描 **{r['will_scan']}** 篇，逐篇生成建议进审阅队列；"
                 "全程可停止，建议不会自动写入任何笔记。")
-        else:
+        elif kind == "topic":
             r = self.curator.recalibrate_dry_run(scope)
             self._ai_append_md(
                 f"\n### Dry-run 预览\n将扫描 **{r['will_scan']}** 篇（纯查缓存，不读笔记文件）\n"
                 f"- 缓存证据充分：**{r['cache_ok']}** 篇\n"
                 f"- 证据不足（打平/缺记录）：**{r['needs_reread']}** 篇 → 只标记，"
                 "不自动重读；可在审阅队列点『重读校准』显式处理（本地规则，零模型成本）。")
+        else:
+            r = self.curator.edges_dry_run(scope, self._cur_all_pairs.isChecked())
+            self._ai_append_md(
+                f"\n### Dry-run 预览\n可评估关联对 **{r['will_pairs']}** 对"
+                f"（范围含孤立点 **{r['isolated']}** 篇 · 已在队列 {r['pending']} 对）\n"
+                "采纳 = 在低连接侧笔记追加 ## 相关 双链（快照可回滚）。"
+                "默认只产「孤立救援」与「虚线升实线」两类；孤立救援对置信 ≤0.65，"
+                "批量阈值 0.8 不会放行，需逐条人工确认——这是有意为之。")
 
     def _curator_start_scan(self):
         if self._cur_scan:                        # 防重入
             self.statusBar().showMessage("策展扫描进行中…", 2500)
             return
         kind = self.CUR_MODE_KIND[self._ai_mode.currentText()]
-        paths = self.curator.resolve_scope(self._curator_scope())
-        if not paths:
-            self.statusBar().showMessage("所选范围内没有笔记", 3000)
+        if kind == "edge":
+            queue = self.curator.edge_candidates(
+                self._curator_scope(), self._cur_all_pairs.isChecked())
+            unit = "对"
+        else:
+            queue = self.curator.resolve_scope(self._curator_scope())
+            unit = "篇"
+        if not queue:
+            self.statusBar().showMessage(
+                "所选范围内没有可发现的关联对" if kind == "edge"
+                else "所选范围内没有笔记", 3000)
             return
-        self._cur_scan = {"kind": kind, "queue": paths, "total": len(paths),
-                          "scanned": 0, "added": 0, "cancel": False}
+        self._cur_scan = {"kind": kind, "queue": queue, "total": len(queue),
+                          "scanned": 0, "added": 0, "cancel": False, "unit": unit}
         self._btn_cur_scan.setEnabled(False)
         self._btn_cur_dry.setEnabled(False)
         self._btn_cur_stop.setEnabled(True)
-        self._append_log(f"▶ 策展扫描（{kind}）：{len(paths)} 篇")
+        self._cur_all_pairs.setEnabled(False)     # 扫描期禁改勾选（队列是开扫快照）
+        self._append_log(f"▶ 策展扫描（{kind}）：{len(queue)} {unit}")
         QTimer.singleShot(0, self._curator_tick)
 
     def _curator_tick(self):
@@ -2213,8 +2238,9 @@ class MainWindow(QMainWindow):
         if s["cancel"] or not s["queue"]:
             self._curator_finish()
             return
-        fn = (self.curator.wikilinks_scan if s["kind"] == "wikilink"
-              else self.curator.recalibrate_scan)
+        fn = {"wikilink": self.curator.wikilinks_scan,
+              "topic": self.curator.recalibrate_scan,
+              "edge": self.curator.edges_scan}[s["kind"]]
         r = fn(s["queue"], CURATOR_BATCH)
         del s["queue"][:r["scanned"]]
         s["scanned"] += r["scanned"]
@@ -2228,10 +2254,13 @@ class MainWindow(QMainWindow):
         self._btn_cur_scan.setEnabled(True)
         self._btn_cur_dry.setEnabled(True)
         self._btn_cur_stop.setEnabled(False)
+        self._cur_all_pairs.setEnabled(True)
         self._cur_status.setText("")
         if s:
-            head = "扫描完成" if not s["cancel"] else f"扫描已停止（剩 {len(s['queue'])} 未处理）"
-            msg = f"{head} · 扫描 {s['scanned']} 篇 · 待审阅建议共 {self.store.count_pending()} 条"
+            unit = s.get("unit", "篇")
+            head = "扫描完成" if not s["cancel"] else f"扫描已停止（剩 {len(s['queue'])} {unit}未处理）"
+            msg = (f"{head} · 扫描 {s['scanned']} {unit} · "
+                   f"待审阅建议共 {self.store.count_pending()} 条")
             self._append_log(f"✅ {msg}")
             self.statusBar().showMessage(msg, 6000)
         self.open_review()
@@ -2245,7 +2274,8 @@ class MainWindow(QMainWindow):
     # ---------- 审阅队列面板 ----------
     _REV_STATUS_CN = {"pending": "待处理", "applied": "已采纳",
                       "skipped": "已跳过", "obsolete": "已失效"}
-    _REV_KIND_CN = {"wikilink": "双链", "topic": "改分类"}
+    _REV_KIND_CN = {"wikilink": "双链", "topic": "改分类", "edge": "关联"}
+    _EDGE_TIER_CN = {"dashed": "虚线升实线", "rescue": "孤立救援", "library": "全库对"}
 
     def _build_review_panel(self) -> QWidget:
         w = QWidget()
@@ -2259,6 +2289,7 @@ class MainWindow(QMainWindow):
         self._rev_kind.addItem("全部", None)
         self._rev_kind.addItem("双链", "wikilink")
         self._rev_kind.addItem("改分类", "topic")
+        self._rev_kind.addItem("关联", "edge")
         self._rev_status = FlatCombo()
         for key, cn in self._REV_STATUS_CN.items():   # dict 是 英文key→中文label
             self._rev_status.addItem(cn, key)
@@ -2322,6 +2353,11 @@ class MainWindow(QMainWindow):
                 sug = f"{pl.get('now_topic', '?')} → {s['target']}"
                 if pl.get("needs_reread"):
                     sug += "（待重读）"
+            elif s["kind"] == "edge":
+                kws = "、".join((pl.get("shared_keywords") or [])[:3])
+                sug = (f"相关段追加 [[{s['target']}]]"
+                       f"（{self._EDGE_TIER_CN.get(pl.get('tier'), '?')}"
+                       + (f" · 共享 {kws}" if kws else "") + "）")
             else:
                 sug = f"[[{s['target']}]]"
                 if pl.get("insert_at") is None:

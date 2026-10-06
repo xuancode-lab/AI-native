@@ -248,10 +248,10 @@ class SQLiteStore:
         new_t = os.path.splitext(os.path.basename(new))[0]
         self.conn.execute("UPDATE links SET to_target=? WHERE to_target=?",
                           (new_t, old_t))
-        # 未处理的链接建议跟随改名
+        # 未处理的链接/关联建议跟随改名（edge 与 wikilink 的 target 都是 stem）
         self.conn.execute(
-            "UPDATE suggestions SET target=? WHERE kind='wikilink' AND target=? "
-            "AND status='pending'", (new_t, old_t))
+            "UPDATE suggestions SET target=? WHERE kind IN ('wikilink','edge') "
+            "AND target=? AND status='pending'", (new_t, old_t))
         self.conn.commit()
         self._bump()
 
@@ -271,7 +271,7 @@ class SQLiteStore:
         self.conn.execute(
             "UPDATE suggestions SET status='obsolete', "
             "resolved_at=datetime('now','localtime') "
-            "WHERE status='pending' AND (file_path=? OR (kind='wikilink' AND target=?))",
+            "WHERE status='pending' AND (file_path=? OR (kind IN ('wikilink','edge') AND target=?))",
             (path, stem))
         self.conn.commit()
         self._bump()

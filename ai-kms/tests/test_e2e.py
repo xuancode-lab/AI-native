@@ -162,6 +162,34 @@ class TestEndToEnd(unittest.TestCase):
         kws = [x["value"] for x in self.env.store.atoms_for(rel) if x["kind"] == "keyword"]
         self.assertIn("图论", kws)
 
+    def test_edge_discovery_flow(self):
+        """v1.0 发现关联链路：dashed 对 → 审阅队列 → 阈值批量采纳 → 图谱升实线；孤立点保持。"""
+        from core.curator import Curator
+        curator = Curator(self.env.store, self.env.vault, self.pipe)
+        self.pipe.ingest_raw("# 向量数据库\n向量 索引 检索 存储 技术 架构 系统。")
+        self.pipe.ingest_raw("# 向量检索调优\n向量 索引 检索 调优 技术 架构 系统。")
+        self.pipe.ingest_raw("# 周报模板\n本周进展 下周计划 例会安排。")
+
+        cands = curator.edge_candidates({"type": "all"})
+        self.assertTrue(cands, "共享≥2 词的虚线对应产生候选")
+        self.assertIn("dashed", {d["tier"] for d in cands})
+        curator.edges_scan(cands, limit=50)
+        self.assertGreaterEqual(self.env.store.count_pending("edge"), 1)
+
+        # 阈值 0.7：放行 dashed（≥0.75），挡下孤立救援（封顶 0.65）
+        rows = self.env.store.pending_suggestions(kind="edge", min_conf=0.7)
+        ok = sum(1 for r in rows if curator.apply_suggestion(r["id"]).get("ok"))
+        self.assertGreaterEqual(ok, 1)
+
+        g = self.graph.build()
+        v1 = next(n["id"] for n in g["nodes"] if "向量数据库" in n["id"])
+        v2 = next(n["id"] for n in g["nodes"] if "向量检索调优" in n["id"])
+        solid = [{g["nodes"][e["source"]]["id"], g["nodes"][e["target"]]["id"]}
+                 for e in g["edges"] if e["kind"] == "link"]
+        self.assertIn({v1, v2}, solid, "批量采纳后虚线应升为实线")
+        self.assertIn("周报模板.md", [p.rsplit("/", 1)[-1] for p in g["isolated"]],
+                      "低置信救援对不该被默认批量放行")
+
 
 if __name__ == "__main__":
     unittest.main()
