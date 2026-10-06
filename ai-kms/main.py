@@ -82,7 +82,7 @@ def cmd_drop(store, vault, dir_arg):
 
 
 def cmd_watch(store, vault):
-    cmd_drop(store, vault, str(settings.PROJECT_ROOT / "data" / "dropbox"))
+    cmd_drop(store, vault, str(settings.DROPBOX_DIR))
 
 
 def cmd_batch(store, vault, dir_arg):
@@ -128,7 +128,7 @@ def cmd_export(store, vault, arg, full: bool):
     from pathlib import Path
     from core.export import export_full, export_structure
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = Path(arg) if arg else settings.PROJECT_ROOT / "data" / "exports" / stamp
+    out = Path(arg) if arg else settings.EXPORT_DIR / stamp
     if full:
         zp = export_full(store, vault, out)
         print(f"全库打包完成 → {zp}（{zp.stat().st_size / 1024:.0f} KB）")
@@ -257,11 +257,11 @@ def main():
     fn = {
         "scan": lambda: cmd_scan(store, vault),
         "ingest": lambda: cmd_ingest(store, vault, a.arg or ""),
-        "drop": lambda: cmd_drop(store, vault, a.arg or str(settings.PROJECT_ROOT / "data" / "dropbox")),
+        "drop": lambda: cmd_drop(store, vault, a.arg or str(settings.DROPBOX_DIR)),
         "watch": lambda: cmd_watch(store, vault),
         "search": lambda: cmd_search(store, vault, a.arg or ""),
         "dump": lambda: cmd_dump(store, vault, a.arg or ""),
-        "batch": lambda: cmd_batch(store, vault, a.arg or str(settings.PROJECT_ROOT / "data" / "dropbox")),
+        "batch": lambda: cmd_batch(store, vault, a.arg or str(settings.DROPBOX_DIR)),
         "reindex": lambda: cmd_reindex(store, vault),
         "fts-rebuild": lambda: cmd_fts_rebuild(store, vault),
         "export": lambda: cmd_export(store, vault, a.arg, full=False),

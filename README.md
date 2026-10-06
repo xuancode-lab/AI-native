@@ -391,6 +391,44 @@ python -m pytest tests -q            # 108 例
 
 ---
 
+## 打包发布（exe）
+
+入口 `kms_entry.py`（双击直进 GUI），构建脚本 `build.py` 已内置依赖裁剪与数据文件收集：
+
+```bash
+pip install pyinstaller          # 或 pip install nuitka
+python build.py pyinstaller      # 日常/内测：onedir，几分钟出包
+python build.py nuitka           # 商用发布：编译成 C（启动快、源码不再是可拆字节码）
+python build.py nuitka --onefile # Nuitka 单文件 exe
+```
+
+**策略**：开发期用 PyInstaller onedir（钩子成熟、构建快）；正式商用发布切 Nuitka（真编译，代码保护强一个量级）。PySide6 打包后 80~170MB 属正常。
+
+**macOS/Linux 预埋（已完成，代码级跨平台就绪）**：
+- 平台标准数据目录：exe 不可写时 Win→`%LOCALAPPDATA%`、Mac→`~/Library/Application Support`（天然避开 iCloud 同步 × SQLite-WAL 冲突）、Linux→XDG
+- 快捷键用 `QKeySequence` 标准键，Mac 自动 ⌘S/⌘N/⌘W；提示文案随平台显示
+- 无边框自绘标题栏仅 Windows 启用；Mac/Linux 用原生标题栏（流量灯归系统）
+- 品牌图标单一 SVG 源：`python tools/make_icons.py` 一键产出 PNG 全尺寸 + `.ico`（Windows）+ `.iconset`（Mac 上再跑 `iconutil` 得 `.icns`）
+- 尚需的商业化步骤（非代码）：Apple Developer $99/年 → Developer ID 签名 + notarytool 公证 → DMG；跨平台自动构建建议 GitHub Actions 双 runner（开源项目免费）
+
+**数据位置三形态**（`settings` 路径体系，自动决策 + 显式覆盖）：
+
+| 形态 | 条件 | 用户文件落点 |
+|---|---|---|
+| 便携（默认） | exe 所在目录**可写** | `<exe同级>\data\`——整个文件夹拷走即迁移 |
+| 受保护安装 | exe 不可写（如 Program Files） | 自动降级 `%LOCALAPPDATA%\AI-Native KMS\data\`，避开 UAC VirtualStore 黑洞 |
+| 自定义 | `.env` 写 `KMS_DATA_ROOT=D:/MyKnowledge`（或设置面板"更改位置…"） | 任意目录；`KMS_VAULT_PATH` 可让知识文件单独放（如"文档"），与索引分离 |
+
+设置面板"更改位置…"会写入 `.env` 并可选**迁移 vault/dropbox**（索引不迁，重启后启动对账自动重建），重启生效。`.env` 也随之落在可写基地（`APP_HOME`）。
+
+**已实测**（PyInstaller 6.22 / Python 3.12 / Windows 10）：
+- 产物 `dist/AI-Native-KMS/`（173MB，含 `AI-Native-KMS.exe`），jieba 词典、SVG 图标均在包内
+- 双击 exe 正常启动，`data/`（kms.db + vault + dropbox + logs + snapshots）生成在 exe 同级 ✓
+- GUI 链路自动排除 `mcp/pydantic/WebEngine/Qml` 等 22 个重型模块
+- 回归：源码态 108/108 测试不受影响
+
+---
+
 ## 路线图
 
 - [x] 阶段 2 —— 知识图谱 + 语义/BM25 检索 + 力导向可视化 + IDE 风格 GUI
@@ -407,4 +445,21 @@ python -m pytest tests -q            # 108 例
 
 ## 许可
 
-个人知识管理项目，按需自用。
+本项目以 **GNU AGPL-3.0-or-later** 发布（官方全文见仓库根目录 [`LICENSE`](LICENSE)）。
+
+- **免费与自由**：本地个人使用、学习、修改、自托管均无任何限制——这正是"数据不锁定"的代码层兑现。
+- **Copyleft 约束**：分发本项目（含打包分发二进制），或修改后通过网络对外提供服务，都必须以 AGPL 同步开源完整对应源码（AGPL §13）。
+- **商业双授权**：桌面本体永久免费开源；Sync / 多设备 / 团队等增值能力，或需要闭源嵌入、行业定制交付的场景，可另行洽谈商业授权（联系方式：见仓库主页）。作者保留全部版权，双授权不设 CLA 门槛。
+
+**开源核心边界**：后续付费增值模块会在目录/仓库层面物理隔离——**删掉付费部分，开源部分仍是完整可用的系统**；开源主干不会倒退成功能残缺的试用版。
+
+**第三方致谢**（依赖均为宽松许可，与 AGPL 兼容）：
+
+| 依赖 | 许可 |
+|---|---|
+| PySide6 (Qt6) | LGPL-3.0 / GPL-2.0 / GPL-3.0 三重许可（pip wheels 动态链接，按 LGPL 合规） |
+| watchdog / requests | Apache-2.0 |
+| python-dotenv | BSD |
+| jieba / mcp（官方 SDK） | MIT |
+
+> 思想来源（Obsidian / LLMWiki / GBrain / Claude / jev）仅为设计理念借鉴，代码库不含其任何实现或接口绑定。

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 from config import settings
@@ -112,7 +113,7 @@ QTabBar::tab:selected {
 QTextBrowser, QTextEdit, QPlainTextEdit {
     background-color: #ffffff;
     border: 1px solid #ececec;
-    font-family: Consolas, 'Courier New', monospace;
+    font-family: Consolas, Menlo, 'Courier New', monospace;
     font-size: 13px;
     padding: 3px 6px;
 }
@@ -579,6 +580,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI-native KMS")
+        # 品牌图标（任务栏/Dock）：单一 SVG 源，多平台图标由 tools/make_icons.py 派生
+        _ic = Path(__file__).parent / "icons" / "app.svg"
+        if _ic.exists():
+            self.setWindowIcon(QIcon(str(_ic)))
         self.resize(1280, 800)
 
         self.store = SQLiteStore()
@@ -667,9 +672,10 @@ class MainWindow(QMainWindow):
 
         # Ctrl+S 保存快捷键（笔记区）
         from PySide6.QtGui import QShortcut
-        QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_note)
-        QShortcut(QKeySequence("Ctrl+N"), self, activated=self._new_note)
-        QShortcut(QKeySequence("Ctrl+W"), self, activated=self._close_note)
+        # 标准键：Windows=Ctrl，macOS 自动映射为 ⌘（平台预埋）
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Save), self, activated=self._save_note)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.New), self, activated=self._new_note)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Close), self, activated=self._close_note)
 
         # 中间：工作区（堆叠）
         self.workspace = QStackedWidget()
@@ -723,13 +729,16 @@ class MainWindow(QMainWindow):
         main_split.setSizes([800, 0])        # 底栏默认收起
 
         # 无边框窗口：标题栏(自绘白底) + 内容 垂直包裹
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self._frameless = sys.platform == "win32"   # 无边框自绘标题栏仅 Windows
+        if self._frameless:
+            self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         container = QWidget()
         container_lay = QVBoxLayout(container)
         container_lay.setContentsMargins(0, 0, 0, 0)
         container_lay.setSpacing(0)
-        self._title_bar = _TitleBar(self)
-        container_lay.addWidget(self._title_bar)
+        self._title_bar = _TitleBar(self) if self._frameless else None
+        if self._title_bar is not None:
+            container_lay.addWidget(self._title_bar)
         container_lay.addWidget(self._toolbar)
         container_lay.addWidget(main_split, 1)
         self.setCentralWidget(container)
@@ -737,7 +746,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("watcher: 正在监听 data/dropbox")
 
         # 监听器
-        self.watcher = DropWatcher(Path(settings.PROJECT_ROOT / "data" / "dropbox"),
+        self.watcher = DropWatcher(settings.DROPBOX_DIR,
                                    self.store, self.pipe)
         n = self.watcher.ingest_existing()
         if n:
@@ -928,11 +937,13 @@ class MainWindow(QMainWindow):
         self._note_edit_btn = QPushButton("编辑")
         self._note_edit_btn.setCheckable(True)
         self._note_edit_btn.toggled.connect(self._toggle_edit_mode)
-        self._note_save_btn = QPushButton("保存 (Ctrl+S)")
+        self._mac = sys.platform == "darwin"
+        mod = "⌘" if self._mac else "Ctrl"
+        self._note_save_btn = QPushButton(f"保存 ({mod}+S)")
         self._note_save_btn.clicked.connect(self._save_note)
         self._note_save_btn.setEnabled(False)
         self._note_close_btn = QPushButton("✕ 关闭")
-        self._note_close_btn.setToolTip("关闭当前笔记 (Ctrl+W)，未保存改动会提示")
+        self._note_close_btn.setToolTip(f"关闭当前笔记 ({'⌘' if sys.platform == 'darwin' else 'Ctrl'}+W)，未保存改动会提示")
         self._note_close_btn.clicked.connect(self._close_note)
         self._note_close_btn.setEnabled(False)
         self._note_path_lbl = QLabel("（未打开笔记）")
@@ -953,7 +964,8 @@ class MainWindow(QMainWindow):
         self.notes_preview.setOpenExternalLinks(False)
         self.notes_preview.anchorClicked.connect(self._on_preview_anchor)
         self.notes_editor = QPlainTextEdit()
-        self.notes_editor.setPlaceholderText("在此编辑 Markdown…  Ctrl+S 保存")
+        self.notes_editor.setPlaceholderText(
+            "在此编辑 Markdown…  " + ("⌘" if sys.platform == "darwin" else "Ctrl") + "+S 保存")
         self.notes_editor.setMinimumHeight(400)
         self._note_stack.addWidget(self.notes_preview)   # index 0 = 预览
         self._note_stack.addWidget(self.notes_editor)    # index 1 = 编辑
@@ -1778,7 +1790,18 @@ class MainWindow(QMainWindow):
         form.addRow("OpenAI兼容 模型：", amodel_ed)
         form.addRow("Ollama 地址：", ourl_ed)
         form.addRow("Ollama 模型：", omod_ed)
-        hint = QLabel("⚠ 密钥以明文存于 ai-kms/.env；判断层规则分类器不需要任何密钥。")
+        # ---- 数据位置 ----
+        loc_box = QHBoxLayout()
+        loc_lbl = QLabel(f"数据根：{settings.DATA_ROOT}\n"
+                         f"知识库：{settings.DEFAULT_VAULT_PATH}")
+        loc_lbl.setStyleSheet("color:#5f6368;")
+        b_loc = QPushButton("更改位置…")
+        b_loc.clicked.connect(self._change_data_root)
+        loc_box.addWidget(loc_lbl, 1)
+        loc_box.addWidget(b_loc, 0)
+        form.addRow("数据位置：", loc_box)
+        hint = QLabel("⚠ 密钥以明文存于 .env；判断层规则分类器不需要任何密钥。"
+                      "更改数据位置需重启生效；vault 为纯 Markdown，可随时整体迁移。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9a6b00;")
         form.addRow(hint)
@@ -1828,6 +1851,59 @@ class MainWindow(QMainWindow):
         p = get_provider()
         self._append_log(f"⚙ 设置已保存（写入 .env）· 当前生效生成后端：{p.name}")
         self.statusBar().showMessage(f"生成后端：{p.name}", 4000)
+
+    def _change_data_root(self):
+        """更改数据根：写 .env(KMS_DATA_ROOT)，可选迁移 vault/dropbox。重启生效。"""
+        from PySide6.QtWidgets import QFileDialog
+        import shutil
+        cur = Path(settings.DATA_ROOT)
+        start = str(cur.parent) if cur.parent != cur else str(cur)
+        new = QFileDialog.getExistingDirectory(self, "选择数据根目录", start)
+        if not new:
+            return
+        dst = Path(new).expanduser().resolve()
+        if dst == cur.resolve():
+            self.statusBar().showMessage("新位置与当前相同", 2500)
+            return
+        answer = QMessageBox.question(
+            self, "迁移数据",
+            f"数据根将改为：\n{dst}\n\n要把现有知识文件（vault / dropbox）移动过去吗？\n"
+            "索引库无需迁移——重启后启动对账会自动重建。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if answer == QMessageBox.StandardButton.Cancel:
+            return
+        if answer == QMessageBox.StandardButton.Yes:
+            try:
+                dst.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(self, "无法创建", f"目标目录不可用：{e}")
+                return
+            failed = []
+            for name in ("vault", "dropbox"):
+                src_item = cur / name
+                if src_item.exists():
+                    try:
+                        shutil.move(str(src_item), str(dst / name))
+                    except OSError as e:
+                        failed.append(f"{name}: {e}")
+            if failed:
+                go = QMessageBox.question(
+                    self, "迁移不完整",
+                    "部分数据未移动成功：\n" + "\n".join(failed)
+                    + "\n\n仍要切换数据位置吗？（未迁移的文件留在原处，可手动拷贝）",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if go != QMessageBox.StandardButton.Yes:
+                    return
+        try:
+            settings.update_env_values({"KMS_DATA_ROOT": str(dst)})
+        except OSError as e:
+            QMessageBox.warning(self, "写入失败", f"无法写 .env：{e}")
+            return
+        self._append_log(f"📦 数据根已改为 {dst}（重启生效）")
+        QMessageBox.information(self, "已设置", "数据位置已写入 .env，重启应用后生效。")
 
     def _rebuild_fts_now(self):
         if not self.store.fts_ok:
@@ -2557,7 +2633,7 @@ class MainWindow(QMainWindow):
                 return True
             # 未拖拽：仅靠近窗口边缘时叠加"缩放覆盖光标"，否则撤销。
             lp = self.mapFromGlobal(gp)
-            edges = self._edge_at(lp)
+            edges = self._edge_at(lp) if self._frameless else (False, False, False, False)
             near_edge = any(edges) and not self.isMaximized()
             if near_edge:
                 shape = self._cursor_for_edges(edges)
@@ -2572,7 +2648,7 @@ class MainWindow(QMainWindow):
 
         elif et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
             lp = self.mapFromGlobal(event.globalPosition().toPoint())
-            edges = self._edge_at(lp)
+            edges = self._edge_at(lp) if self._frameless else (False, False, False, False)
             if any(edges) and not self.isMaximized():
                 self._resize_edges = edges
                 self._resize_start_geo = self.geometry()
@@ -2597,7 +2673,7 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event):
         """窗口状态变化（最大化/还原）→ 同步标题栏按钮图标。"""
         if event.type() == QEvent.Type.WindowStateChange:
-            if hasattr(self, "_title_bar"):
+            if getattr(self, "_title_bar", None) is not None:
                 self._title_bar.set_maximized(self.isMaximized())
         super().changeEvent(event)
 

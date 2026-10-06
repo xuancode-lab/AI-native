@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- 应用品牌图标：知识节点簇（呼应"原子/图谱"核心概念） -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e88e5"/>
+      <stop offset="1" stop-color="#1558b0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- 连线 -->
+  <g stroke="#ffffff" stroke-opacity="0.85" stroke-width="14" stroke-linecap="round">
+    <line x1="256" y1="256" x2="152" y2="140"/>
+    <line x1="256" y1="256" x2="378" y2="162"/>
+    <line x1="256" y1="256" x2="222" y2="398"/>
+    <line x1="152" y1="140" x2="378" y2="162"/>
+  </g>
+  <!-- 中心原子节点 -->
+  <circle cx="256" cy="256" r="62" fill="none" stroke="#ffffff" stroke-width="26"/>
+  <circle cx="256" cy="256" r="16" fill="#ffffff"/>
+  <!-- 卫星节点 -->
+  <circle cx="152" cy="140" r="30" fill="#ffffff"/>
+  <circle cx="378" cy="162" r="30" fill="#ffffff"/>
+  <circle cx="222" cy="398" r="30" fill="#ffffff"/>
+</svg>

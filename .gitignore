@@ -40,3 +40,6 @@ ai-kms/data/
 
 # ---- docs 目录 ----
 docs/
+
+# ---- 打包产物（PyInstaller spec 自动生成）----
+*.spec
