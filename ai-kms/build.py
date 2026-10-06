@@ -43,22 +43,29 @@ def _run(cmd: list[str]) -> int:
 
 
 def build_pyinstaller() -> int:
+    sep = ";" if sys.platform == "win32" else ":"   # --add-data 分隔符平台差异
     args = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
-        "--windowed",                      # 无控制台窗口
+        "--windowed",                      # 无控制台窗口 / Mac 出 .app
         "--name", APP_NAME,
         "--collect-all", "jieba",          # 词典等 package data
         # icons 是纯数据文件，代码里 Path(__file__).parent/'icons' 定位 → 打进 app/icons
-        "--add-data", "app/icons;app/icons",
-        ENTRY,
+        "--add-data", f"app/icons{sep}app/icons",
     ]
+    if sys.platform == "darwin":
+        icns = ROOT / "resources" / "icons" / "appicon.icns"
+        if icns.exists():
+            args += ["--icon", str(icns)]  # 先跑 tools/make_icons.py 生成
+        args += ["--osx-bundle-identifier", "com.xuancode.kms"]
+    args.append(ENTRY)
     for m in QT_TRIM + OTHER_TRIM:
         args += ["--exclude-module", m]
     rc = _run(args)
     if rc == 0:
-        print(f"\n✅ 产物: dist/{APP_NAME}/{APP_NAME}.exe（整个 dist/{APP_NAME} 文件夹即绿色便携包，"
-              f"双击 exe 后数据生成在同级 data/）")
+        tail = (f"{APP_NAME}.app" if sys.platform == "darwin" else f"{APP_NAME}.exe")
+        print(f"\n✅ 产物: dist/{APP_NAME}/{tail}（onedir 文件夹即绿色便携包，"
+              f"数据生成在 exe/App 同级 data/）")
     return rc
 
 

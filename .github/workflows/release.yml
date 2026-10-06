@@ -1,0 +1,93 @@
+name: Build & Release
+
+# tag v* 触发双平台构建 + GitHub Release；也可在 Actions 页手动触发只构建不发布
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ai-kms
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: 测试门禁（全过才打包）
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover tests -v
+      - name: 打包 exe
+        run: python build.py pyinstaller
+      - name: 压成 zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/AI-Native-KMS/* -DestinationPath AI-Native-KMS-win-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-zip
+          path: ai-kms/AI-Native-KMS-win-x64.zip
+
+  build-macos:
+    runs-on: macos-14          # Apple Silicon runner
+    defaults:
+      run:
+        working-directory: ai-kms
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: 测试门禁
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover tests -v
+      - name: 生成 .icns（make_icons 在 mac 上自动 iconutil）
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/make_icons.py
+      - name: 打包 .app → DMG
+        run: |
+          python build.py pyinstaller
+          codesign --force --deep -s - dist/AI-Native-KMS/AI-Native-KMS.app  # ad-hoc 签名（arm64 最低要求）
+          hdiutil create -volname "AI-Native KMS" \
+            -srcfolder dist/AI-Native-KMS/AI-Native-KMS.app -ov \
+            -format UDZO AI-Native-KMS-mac-arm64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: ai-kms/AI-Native-KMS-mac-arm64.dmg
+
+  release:
+    # 仅 tag 触发时发布；两个产物都成功才创建
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            AI-Native-KMS-win-x64.zip
+            AI-Native-KMS-mac-arm64.dmg
+          generate_release_notes: true
