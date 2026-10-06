@@ -19,6 +19,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+for _s in (sys.stdout, sys.stderr):   # CI cp1252 控制台防 UnicodeEncodeError
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 SRC_SVG = ROOT / "app" / "icons" / "app.svg"
 OUT = ROOT / "resources" / "icons"

@@ -18,6 +18,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# CI 的 Windows runner stdout 默认 cp1252，print ✅/中文会抛 UnicodeEncodeError；
+# 统一强制 UTF-8（errors=replace 兜底任何终端），本地 GBK/UTF-8 环境同样安全。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "AI-Native-KMS"
 ENTRY = "kms_entry.py"

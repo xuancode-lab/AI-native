@@ -16,6 +16,8 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8        # runner 默认 cp1252，中文/emoji 输出会炸
     defaults:
       run:
         working-directory: ai-kms
@@ -44,6 +46,8 @@ jobs:
 
   build-macos:
     runs-on: macos-14          # Apple Silicon runner
+    env:
+      PYTHONIOENCODING: utf-8
     defaults:
       run:
         working-directory: ai-kms
