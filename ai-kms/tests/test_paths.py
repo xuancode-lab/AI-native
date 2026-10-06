@@ -24,12 +24,27 @@ class TestPathResolution(unittest.TestCase):
         self.assertTrue(str(got).endswith("km"))
 
     def test_app_home_falls_back_when_not_writable(self):
-        # 非法字符路径必然不可写 → 降级到 LOCALAPPDATA/AI-Native KMS
-        bogus = Path("C:/nul_bad<>|chars")
-        home = settings._app_home(bogus)
-        # 平台无关：应落到各平台标准用户目录（Win=LOCALAPPDATA / Mac=AppSupport / Linux=xdg）
-        self.assertEqual(home, settings._fallback_home())
-        self.assertTrue(str(home).endswith("AI-Native KMS"))
+        # 不依赖路径字法的平台差异（"C:/nul<>|" 在 mac 上是合法相对路径，
+        # 非法字符探测只在 Windows 成立）→ 直接 monkeypatch 可写探测，三平台同一语义
+        orig = settings._is_writable
+        settings._is_writable = lambda d: False
+        try:
+            home = settings._app_home(Path("X:/somewhere"))
+            self.assertEqual(home, settings._fallback_home())
+            self.assertTrue(str(home).endswith("AI-Native KMS"))
+        finally:
+            settings._is_writable = orig
+
+    def test_fallback_home_platform_branch(self):
+        """各 runner 上验证自己平台的分支正确（Mac=AppSupport / Win=AppData）。"""
+        import platform
+        fb = str(settings._fallback_home())
+        sysname = platform.system()
+        if sysname == "Darwin":
+            self.assertIn("Application Support", fb)
+        elif sysname == "Windows":
+            self.assertIn("AppData", fb)
+        self.assertTrue(fb.endswith("AI-Native KMS"))
 
     def test_app_home_stays_when_writable(self, ):
         tmp = Path(os.environ.get("TEMP", ".")) / "kms_writable_probe_dir"
