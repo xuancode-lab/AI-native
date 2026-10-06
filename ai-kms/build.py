@@ -71,9 +71,9 @@ def build_pyinstaller() -> int:
         args += ["--exclude-module", m]
     rc = _run(args)
     if rc == 0:
-        tail = (f"{APP_NAME}.app" if sys.platform == "darwin" else f"{APP_NAME}.exe")
-        print(f"\n✅ 产物: dist/{APP_NAME}/{tail}（onedir 文件夹即绿色便携包，"
-              f"数据生成在 exe/App 同级 data/）")
+        hint = "（.app 实际位置以 dist 下 find 为准）" if sys.platform == "darwin" else ""
+        print(f"\n✅ 构建完成，产物在 dist/{APP_NAME}/ {hint}"
+              f"——onedir 即绿色便携包，数据生成在 exe/App 同级 data/")
     return rc
 
 

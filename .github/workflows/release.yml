@@ -71,10 +71,18 @@ jobs:
       - name: 打包 .app → DMG
         run: |
           python build.py pyinstaller
-          codesign --force --deep -s - dist/AI-Native-KMS/AI-Native-KMS.app  # ad-hoc 签名（arm64 最低要求）
+          # PyInstaller onedir+windowed 的 .app 位置随版本有差异（dist/ 或 dist/<name>/），
+          # 不硬编码——动态定位，找不到就带着 dist 目录列表报错，方便下轮诊断
+          APP=$(find dist -maxdepth 2 -type d -name "AI-Native-KMS.app" | head -1)
+          if [ -z "$APP" ]; then echo "未找到 .app，dist 内容："; find dist -maxdepth 3 | head -40; exit 1; fi
+          echo "APP = $APP"
+          codesign --force --deep -s - "$APP"          # ad-hoc 签名（arm64 最低要求）
+          # 标准拖拽安装 DMG：.app + Applications 快捷方式
+          STAGE=$(mktemp -d)
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
           hdiutil create -volname "AI-Native KMS" \
-            -srcfolder dist/AI-Native-KMS/AI-Native-KMS.app -ov \
-            -format UDZO AI-Native-KMS-mac-arm64.dmg
+            -srcfolder "$STAGE" -ov -format UDZO AI-Native-KMS-mac-arm64.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: mac-dmg
