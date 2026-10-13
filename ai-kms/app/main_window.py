@@ -2,7 +2,7 @@
 
 参考 Android Studio 的多面板布局：
   - 顶部：工具栏（图标按钮）
-  - 左侧：项目导航树（按主题/文件夹组织笔记）
+  - 左侧：原子库知识树（按主题/文件夹组织笔记）
   - 中间：工作区（笔记预览 / 知识图谱 / AI 管家，可切换）
   - 右侧：属性栏（笔记元信息 / 原子 / 相关笔记）
   - 底部：输出区（日志 / 版本历史）
@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -20,7 +22,7 @@ from core.classify.rules import TOPIC_RULES
 from core.graph.engine import GraphEngine
 from core.graph.search import KnowledgeSearch
 from core.ingest.pipeline import IngestPipeline, collect_importable
-from core.ingest.watcher import DropWatcher
+from core.ingest.watcher import DropWatcher, VaultScanWatcher
 from core.storage.sqlite_db import SQLiteStore
 from core.storage.vault import Vault
 from core.aipilot.manager import AIPilot
@@ -328,6 +330,11 @@ class ActivityButton(QToolButton):
     def _refresh(self):
         color = ICON_BLUE if self.isChecked() else ICON_GRAY
         self.setIcon(QIcon(_render_svg(self._icon_name, color, 20)))
+
+
+class _FsDirty(QObject):
+    """VaultScanWatcher 回调在 observer 线程——经此信号编组回主线程（M-D）。"""
+    dirty = Signal(str)           # 需刷新的父目录 rel（''=根）
 
 
 class NavTree(QTreeView):
@@ -673,24 +680,73 @@ class MainWindow(QMainWindow):
 
         # 左侧 Activity Bar（常驻）：上=文件树切换，下=日志/底栏切换（Android Studio 惯例）
         self._left_activity = self._make_activity_bar(
-            top=[("project", "项目导航（文件树）", "left")],
+            top=[("project", "原子库（知识树）", "nav"),
+                 ("explorer", "资源管理器（Vault 磁盘文件）", "explorer")],
             bottom=[("logs", "日志/版本历史（底栏）", "bottom")],
             side="left")
 
-        # 左侧：项目导航树（可折叠，支持拖拽入库）
+        # 左侧：原子库树（可折叠，支持拖拽入库）
         self.nav_tree = NavTree()
         self.nav_tree.setIconSize(QSize(16, 16))
         self.nav_tree.dropped.connect(self._import_paths)
         self.nav_tree.setHeaderHidden(True)
         self.nav_tree.setRootIsDecorated(True)
         self.nav_tree.setAlternatingRowColors(False)
-        self.nav_tree.setMinimumWidth(220)
-        self.nav_tree.setMaximumWidth(320)
         self.nav_tree.doubleClicked.connect(self._on_tree_double_clicked)
         # 右键菜单：新建 / 重命名 / 删除
         self.nav_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.nav_tree.customContextMenuRequested.connect(self._tree_context_menu)
-        self.nav_tree.setVisible(False)      # 默认折叠
+
+        # 资源管理器：Vault 磁盘真相树（与知识树互斥，装在堆叠容器里）
+        self._idx_cache: frozenset = None
+        self._idx_epoch = -1              # 必须先于 FSFileTree 构造（它建完即拉快照）
+        from app.ui.fs_tree import FSFileTree
+        self.fs_tree = FSFileTree(self.vault.vault_path, self._indexed_snapshot)
+        self.fs_tree.setIconSize(QSize(16, 16))
+        self.fs_tree.dropped.connect(self._import_paths)
+        self.fs_tree.doubleClicked.connect(self._on_fs_double_clicked)
+        self.fs_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.fs_tree.customContextMenuRequested.connect(self._fs_context_menu)
+        # VSCode 式面板标题（粗体小字灰，两树一致）
+        def panel_title(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "color:#5f6368; font-size:11px; font-weight:700;"
+                "padding:7px 9px 3px; letter-spacing:1px; background:#fafafa;")
+            return lbl
+        # explorer 页 = 标题 + 树 + 底部"待收录"提示条（M-D）
+        self._explorer_page = QWidget()
+        _ep = QVBoxLayout(self._explorer_page)
+        _ep.setContentsMargins(0, 0, 0, 0)
+        _ep.setSpacing(0)
+        _ep.addWidget(panel_title("资源管理器"))
+        _ep.addWidget(self.fs_tree, 1)
+        self._fs_hint = QLabel("")
+        self._fs_hint.setStyleSheet(
+            "color:#7a5c00; background:#fdf3d7; padding:3px 6px; font-size:11px;")
+        self._fs_hint_btn = QPushButton("全部收录")
+        self._fs_hint_btn.clicked.connect(self._fs_register_all)
+        _hb = QWidget()
+        _hl = QHBoxLayout(_hb)
+        _hl.setContentsMargins(4, 2, 4, 3)
+        _hl.addWidget(self._fs_hint, 1)
+        _hl.addWidget(self._fs_hint_btn)
+        self._fs_hint_bar = _hb
+        _hb.setVisible(False)
+        _ep.addWidget(_hb)
+        self._nav_page = QWidget()
+        _np = QVBoxLayout(self._nav_page)
+        _np.setContentsMargins(0, 0, 0, 0)
+        _np.setSpacing(0)
+        _np.addWidget(panel_title("原子库"))
+        _np.addWidget(self.nav_tree, 1)
+        self._left_panel = QStackedWidget()
+        self._left_panel.addWidget(self._nav_page)       # index 0
+        self._left_panel.addWidget(self._explorer_page)  # index 1
+        self._left_panel.setMinimumWidth(220)
+        self._left_panel.setMaximumWidth(320)
+        self._left_panel.setVisible(False)             # 默认折叠
+        self._left_view = "nav"
 
         # Ctrl+S 保存快捷键：分发器（白板页存画布，其余存笔记）
         from PySide6.QtGui import QShortcut
@@ -726,7 +782,7 @@ class MainWindow(QMainWindow):
         self._h_splitter = QSplitter(Qt.Orientation.Horizontal)
         h_splitter = self._h_splitter
         h_splitter.addWidget(self._left_activity)
-        h_splitter.addWidget(self.nav_tree)
+        h_splitter.addWidget(self._left_panel)
         h_splitter.addWidget(self.workspace)
         h_splitter.addWidget(self.props_panel)
         h_splitter.addWidget(self._right_activity)
@@ -780,6 +836,15 @@ class MainWindow(QMainWindow):
         if n:
             self._boot_msg(f"启动时收录 {n} 篇历史素材。")
         self.watcher.start()
+
+        # Vault 磁盘监听（M-D）：observer 线程→Signal queued→主线程去抖合并
+        self._fs_pending: set = set()
+        self._fs_timer_on = False
+        self._fs_dirty = _FsDirty(self)
+        self._fs_dirty.dirty.connect(self._fs_mark_dirty)
+        self.vault_watch = VaultScanWatcher(self.vault.vault_path,
+                                            self._fs_dirty.dirty.emit)
+        self.vault_watch.start()
 
         self._refresh_tree()
 
@@ -847,9 +912,33 @@ class MainWindow(QMainWindow):
 
     # ---------- 面板折叠 ----------
     def _toggle_panel(self, name: str):
-        """折叠/展开左/右/下面板。Activity Bar 图标始终可见、随状态变色。"""
+        """折叠/展开左/右/下面板。Activity Bar 图标始终可见、随状态变色。
+        左列两图标（nav/explorer）是视图切换器：同视图再点=收起面板，
+        异视图=保持展开仅换页；面板状态记在 _panel_state["left"]。"""
         main_split = self._main_split
         h_splitter = self._h_splitter
+
+        if name in ("nav", "explorer"):
+            view_idx = 0 if name == "nav" else 1
+            expanded = self._panel_state.get("left", False)
+            if expanded and self._left_view == name:
+                self._panel_state["left"] = False           # 再点当前视图=收起
+            else:
+                self._panel_state["left"] = True
+                self._left_view = name
+                self._left_panel.setCurrentIndex(view_idx)
+                if name == "explorer":
+                    self.fs_tree.reload_root()              # 切入即对齐磁盘真相
+                    self._fs_pending.clear()                # 挂起的监听增量已被全量覆盖
+                    self._fs_update_hint()
+            now_open = self._panel_state["left"]
+            self._left_panel.setVisible(now_open)
+            sizes = list(h_splitter.sizes())
+            sizes[1] = self._panel_sizes["left"] if now_open else 0
+            h_splitter.setSizes(sizes)
+            self._sync_activity()
+            return
+
         self._panel_state[name] = not self._panel_state[name]
         expanded = self._panel_state[name]
 
@@ -857,12 +946,7 @@ class MainWindow(QMainWindow):
         if btn and btn.isChecked() != expanded:
             btn.setChecked(expanded)
 
-        if name == "left":
-            self.nav_tree.setVisible(expanded)
-            sizes = list(h_splitter.sizes())
-            sizes[1] = self._panel_sizes["left"] if expanded else 0
-            h_splitter.setSizes(sizes)
-        elif name == "right":
+        if name == "right":
             self.props_panel.setVisible(expanded)
             sizes = list(h_splitter.sizes())
             sizes[3] = self._panel_sizes["right"] if expanded else 0
@@ -872,6 +956,383 @@ class MainWindow(QMainWindow):
             sizes = list(main_split.sizes())
             sizes[1] = self._panel_sizes["bottom"] if expanded else 0
             main_split.setSizes(sizes)
+
+    # ---------- 资源管理器支撑（M-B） ----------
+    def _sync_activity(self):
+        """nav/explorer 两按钮按（面板开态, 当前视图）互斥点亮。"""
+        open_ = self._panel_state.get("left", False)
+        for panel in ("nav", "explorer"):
+            btn = self._activity_buttons.get(panel)
+            if btn is not None:
+                btn.setChecked(open_ and self._left_view == panel)
+
+    def _indexed_snapshot(self) -> frozenset:
+        """vault_files 路径快照，store.epoch 失效（写路径自增，权威且免手动刷）。"""
+        if self._idx_cache is None or self._idx_epoch != self.store.epoch:
+            self._idx_cache = frozenset(f["path"] for f in self.store.all_files())
+            self._idx_epoch = self.store.epoch
+        return self._idx_cache
+
+    def _on_fs_double_clicked(self, idx):
+        from app.ui.fs_tree import FS_ROLE_REL, FS_ROLE_STATE
+        from core.storage.fsindex import FileState
+        rel, st = idx.data(FS_ROLE_REL), idx.data(FS_ROLE_STATE)
+        if not rel:
+            return
+        if st in (FileState.FOLDER, FileState.FOLDER_EMPTY):
+            self.fs_tree.setExpanded(idx, not self.fs_tree.isExpanded(idx))
+        elif st == FileState.ATOMIC:
+            self._open_note(rel)
+        elif st == FileState.CANVAS:
+            if self.canvas_ws.open_document(rel):
+                self.workspace.setCurrentIndex(WS_CANVAS)
+        elif st == FileState.RAW:
+            self.statusBar().showMessage(
+                f"{rel} 是原始文件（未收录）——右键「收录」后进知识库", 5000)
+        else:                                    # IMAGE / OTHER：系统预览
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(
+                str(self.vault.vault_path / rel)))
+
+    def _fs_after_mutation(self, dirty_rel: str = "") -> None:
+        """文件树写操作统一收尾：刷该子树 + 知识树随索引联动 + 待收录计数。"""
+        target = dirty_rel if dirty_rel else ""
+        if not self.fs_tree.refresh_subtree(target):
+            par = target.rsplit("/", 1)[0] if "/" in target else ""
+            if not self.fs_tree.refresh_subtree(par):
+                self.fs_tree.reload_root()
+        self._refresh_tree()
+        self._fs_update_hint()
+
+    # ---------- vault 监听胶水（M-D：标脏去抖 + 不可见挂起 + 幂等重扫） ----------
+    def _fs_mark_dirty(self, rel_dir: str) -> None:
+        self._fs_pending.add(rel_dir)
+        if not self._fs_timer_on:
+            self._fs_timer_on = True
+            QTimer.singleShot(2000, self._fs_refresh_now)
+
+    def _fs_refresh_now(self) -> None:
+        self._fs_timer_on = False
+        if not self._fs_pending:
+            return
+        if not (self._panel_state.get("left", False) and self._left_view == "explorer"):
+            return                      # 面板不在看：pending 留着，切入 explorer 时补做
+        rels, self._fs_pending = set(self._fs_pending), set()
+        for rel in sorted(rels):
+            if not self.fs_tree.refresh_subtree(rel):
+                par = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                if par and not self.fs_tree.refresh_subtree(par):
+                    self.fs_tree.reload_root()
+        self._fs_update_hint()
+
+    def _raw_rels(self) -> list:
+        """vault 内全部未入库文本笔记（待收录计数与"全部收录"共用）。"""
+        idx = self._indexed_snapshot()
+        out = []
+        try:
+            for p in self.vault.vault_path.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name.startswith(".") or p.name.startswith("~$"):
+                    continue
+                if p.suffix.lower() not in (".md", ".txt", ".rst"):
+                    continue
+                rel = p.relative_to(self.vault.vault_path).as_posix()
+                if rel not in idx:
+                    out.append(rel)
+        except OSError:
+            pass
+        return sorted(out)
+
+    def _fs_update_hint(self) -> None:
+        n = len(self._raw_rels())
+        self._fs_hint.setText(f"原始文件 {n} 个待收录")
+        self._fs_hint_bar.setVisible(n > 0)
+
+    def _fs_register_all(self) -> None:
+        self._fs_register(self._raw_rels())
+
+    def _fs_context_menu(self, pos):
+        """资源管理器右键：按状态出项。动作全走 _fs_* 槽（探针可直调）。"""
+        from app.ui.fs_tree import FS_ROLE_REL, FS_ROLE_STATE
+        from core.storage.fsindex import FileState as FS
+        idx = self.fs_tree.indexAt(pos)
+        rel = idx.data(FS_ROLE_REL) if idx.isValid() else None
+        st = idx.data(FS_ROLE_STATE) if idx.isValid() else None
+        menu = QMenu(self.fs_tree)
+
+        def add(text, fn):
+            menu.addAction(text, lambda _=False: fn())
+
+        if not rel:                                   # 空白区
+            add("📁 新建文件夹…", lambda: self._fs_new_folder())
+            add("↻ 刷新", self.fs_tree.reload_root)
+        else:
+            if idx.isValid() and not self.fs_tree.selectionModel().isSelected(idx):
+                self.fs_tree.selectionModel().clearSelection()
+                idx.setSelected(True)
+            sel = self.fs_tree.selected_rels() or [rel]
+            multi = len(sel) > 1
+            if st == FS.ATOMIC and not multi:
+                add("打开笔记", lambda: self._open_note(rel))
+            if st == FS.CANVAS and not multi:
+                add("打开白板", lambda: (
+                    self.canvas_ws.open_document(rel),
+                    self.workspace.setCurrentIndex(WS_CANVAS)))
+            if multi or st in (FS.RAW, FS.FOLDER, FS.FOLDER_EMPTY):
+                add("📥 收录" + ("（选中项）" if multi else ""),
+                    lambda: self._fs_register(sel))
+            if not multi:
+                if st == FS.ATOMIC:
+                    add("✎ 重命名…", lambda: self._rename_note(rel))
+                elif st == FS.RAW:
+                    add("✎ 重命名…", lambda: self._fs_rename_raw(rel))
+                elif st == FS.CANVAS:
+                    add("✎ 重命名白板…", lambda: self._rename_canvas(rel))
+                elif st in (FS.FOLDER, FS.FOLDER_EMPTY):
+                    add("✎ 重命名文件夹…", lambda: self._fs_rename_dir(rel))
+            add("→ 移动到文件夹…", lambda: self._fs_move(sel))
+            menu.addSeparator()
+            if multi or st not in (FS.CANVAS, FS.ATOMIC):
+                add("🗑 删除" + ("（选中项）" if multi else ""),
+                    lambda: self._fs_delete(sel))
+            else:
+                add("🗑 删除", lambda: self._fs_delete([rel]))
+            add("在系统资源管理器中显示", lambda: self._fs_reveal(rel))
+        menu.exec(self.fs_tree.viewport().mapToGlobal(pos))
+
+    # ---------- 资源管理器写操作（M-C 不变式：盘先动、库后动、异常回滚盘） ----------
+    def _fs_register(self, rels) -> int:
+        """收录：vault 内原始文件就地登记（register_existing），绝不拷贝第二份。"""
+        from app.ui.fs_tree import FS_ROLE_REL, FS_ROLE_STATE
+        from core.storage.fsindex import FileState as FS
+        todo: list[str] = []
+        for rel in rels:
+            idx = self.fs_tree.item_index(rel)
+            st = idx.data(FS_ROLE_STATE) if idx else None
+            if st in (FS.FOLDER, FS.FOLDER_EMPTY):
+                for p in sorted((self.vault.vault_path / rel).rglob("*")):
+                    if (p.is_file() and not p.name.startswith(".")
+                            and p.suffix.lower() in (".md", ".txt", ".rst")):
+                        todo.append(p.relative_to(self.vault.vault_path).as_posix())
+            elif st == FS.RAW:
+                todo.append(rel)
+        n_ok = n_dup = 0
+        for r in todo:
+            res = self.pipe.register_existing(r)
+            if res["status"] == "registered":
+                n_ok += 1
+            elif res["status"] == "duplicate":
+                n_dup += 1
+        for parent in {r.rsplit("/", 1)[0] if "/" in r else "" for r in todo}:
+            self.fs_tree.refresh_subtree(parent)
+        self._refresh_tree()
+        self._refresh_ai_notes()
+        self._fs_update_hint()
+        self._append_log(f"📥 收录完成：登记 {n_ok} 篇"
+                         + (f"，内容重复跳过 {n_dup}" if n_dup else ""))
+        self.statusBar().showMessage(f"已收录 {n_ok} 篇", 4000)
+        return n_ok
+
+    def _fs_new_name(self, title: str, old: str = ""):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, title, "新名称：", text=old)
+        return name.strip() if ok and name.strip() else None
+
+    def _fs_rename_raw(self, rel: str) -> None:
+        name = self._fs_new_name("重命名文件", Path(rel).stem)
+        if not name:
+            return
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        new_rel = (parent + "/" if parent else "") + re.sub(
+            r'[\\/:*?"<>|]', "-", name)[:60] + Path(rel).suffix
+        target = self.vault.vault_path / new_rel
+        if target.exists():
+            QMessageBox.warning(self, "已存在", str(new_rel))
+            return
+        (self.vault.vault_path / rel).rename(target)
+        self._fs_after_mutation(parent)
+
+    def _fs_rename_dir(self, rel: str) -> None:
+        name = self._fs_new_name("重命名文件夹", Path(rel).name)
+        if not name:
+            return
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        safe = re.sub(r'[\\/:*?"<>|]', "-", name)[:60]
+        new_rel = (parent + "/" if parent else "") + safe
+        if new_rel == rel:
+            return
+        if (self.vault.vault_path / new_rel).exists():
+            QMessageBox.warning(self, "已存在", new_rel)
+            return
+        (self.vault.vault_path / rel).rename(self.vault.vault_path / new_rel)
+        try:
+            res = self.store.rename_prefix(rel, new_rel)
+            # 前缀一律不带尾斜杠——under_prefix 严格段匹配约定
+            self._rewrite_canvas_node_files(rel, new_rel)
+        except Exception as e:
+            (self.vault.vault_path / new_rel).rename(self.vault.vault_path / rel)
+            QMessageBox.warning(self, "改名失败已回滚", str(e))
+            return
+        self._fs_after_mutation(parent)
+        self._render_graph()
+        self._append_log(f"✎ 文件夹改名 {rel} → {new_rel}"
+                         f"（级联 {res['files']} 行 / {res['payloads']} 条建议）")
+
+    def _fs_move(self, rels) -> int:
+        from app.ui.fs_tree import VaultDirPicker
+        from PySide6.QtWidgets import QDialog
+        sel = [r for r in rels]
+        if not sel:
+            return 0
+        picker = VaultDirPicker(self.vault.vault_path, "移动到…", self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return 0
+        dest = picker.selected_rel()
+        if dest is None:
+            return 0
+        moved = 0
+        for rel in sel:
+            name = rel.rsplit("/", 1)[-1]
+            new_rel = f"{dest}/{name}" if dest else name
+            if new_rel == rel or (self.vault.vault_path / new_rel).exists():
+                continue
+            (self.vault.vault_path / rel).rename(self.vault.vault_path / new_rel)
+            try:
+                self.store.rename_prefix(rel, new_rel)
+                self._rewrite_canvas_node_files(rel, new_rel)
+            except Exception as e:
+                (self.vault.vault_path / new_rel).rename(self.vault.vault_path / rel)
+                QMessageBox.warning(self, "移动失败已回滚", f"{rel}: {e}")
+                continue
+            moved += 1
+        if moved:
+            self._fs_after_mutation("")
+            self._render_graph()
+        return moved
+
+    def _fs_delete(self, rels) -> int:
+        from app.ui.fs_tree import FS_ROLE_REL, FS_ROLE_STATE
+        from core.storage.fsindex import FileState as FS
+        rels = [r for r in rels]
+        if not rels:
+            return 0
+        n_indexed = 0
+        n_files = len(rels)
+        for rel in rels:
+            idx = self.fs_tree.item_index(rel)
+            st = idx.data(FS_ROLE_STATE) if idx else None
+            if st in (FS.FOLDER, FS.FOLDER_EMPTY):
+                for p in (self.vault.vault_path / rel).rglob("*"):
+                    if p.is_file():
+                        n_files += 1
+                        r = p.relative_to(self.vault.vault_path).as_posix()
+                        if self.store.get_file(r):
+                            n_indexed += 1
+            elif st == FS.ATOMIC:
+                n_indexed += 1
+        if n_indexed:
+            warn = (f"将删除 {n_files} 个文件，其中 {n_indexed} 个已入库"
+                    f"（原子/链接/建议/快照记录一并清理，版本历史保留）。\n确定？")
+        else:
+            warn = f"将删除 {n_files} 个文件（含未入库原始内容），确定？"
+        if QMessageBox.question(self, "删除", warn,
+                                QMessageBox.StandardButton.Yes
+                                | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != \
+                QMessageBox.StandardButton.Yes:
+            return 0
+        n = 0
+        for rel in rels:
+            idx = self.fs_tree.item_index(rel)
+            st = idx.data(FS_ROLE_STATE) if idx else None
+            if st == FS.CANVAS:
+                self._delete_canvas(rel)          # 自带打开态处理 + orphan
+                n += 1
+                continue
+            p = self.vault.vault_path / rel
+            if st in (FS.FOLDER, FS.FOLDER_EMPTY):
+                sub_indexed, sub_canvas = [], []
+                for q in p.rglob("*"):
+                    if not q.is_file():
+                        continue
+                    r = q.relative_to(self.vault.vault_path).as_posix()
+                    if self.store.get_file(r):
+                        sub_indexed.append(r)
+                    elif r.lower().endswith(".canvas"):
+                        sub_canvas.append(r)
+                if sub_indexed:
+                    self.store.delete_paths(sub_indexed)
+                for crel in sub_canvas:
+                    self.curator.canvas_edge_orphan(crel)
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                if st == FS.ATOMIC:
+                    self.store.delete_file(rel)
+                if p.suffix.lower() == ".canvas":
+                    self.curator.canvas_edge_orphan(rel)
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError as e:
+                    QMessageBox.warning(self, "删除失败", str(e))
+                    continue
+            n += 1
+        self._fs_after_mutation("")
+        self._render_graph()
+        self._append_log(f"🗑 资源管理器删除 {n} 项（{n_indexed} 个入库级联）")
+        return n
+
+    def _fs_new_folder(self) -> None:
+        name = self._fs_new_name("新建文件夹")
+        if not name:
+            return
+        rel = re.sub(r'[\\/:*?"<>|]', "-", name)[:60]
+        (self.vault.vault_path / rel).mkdir(exist_ok=True)
+        self.fs_tree.reload_root()
+
+    def _fs_reveal(self, rel: str) -> None:
+        full = self.vault.vault_path / rel
+        if os.name == "nt":
+            import subprocess
+            subprocess.Popen(["explorer", "/select,", str(full)])
+        else:
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(full.parent)))
+
+    def _rewrite_canvas_node_files(self, old_prefix: str, new_prefix: str) -> int:
+        """目录改名/移动三联之三：其它 .canvas 里的 node.file 引用级联。
+        命中即落盘（走快照通道）；当前打开且干净的文档重载，脏文档提示用户。"""
+        import json
+        from core.storage.fsindex import rewrite_doc_files
+        touched = 0
+        for crel in self.vault.list_canvas_files():
+            raw = self.vault.read_note(crel)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            out, n = rewrite_doc_files(data, old_prefix, new_prefix)
+            if not n:
+                continue
+            self.canvas_ws.snapshots.write(
+                crel, json.dumps(out, ensure_ascii=False, indent=2),
+                "白板路径级联", require_confirm=False)
+            touched += 1
+            doc = self.canvas_ws.doc
+            if doc is not None and doc.rel_path == crel:
+                if not doc.dirty:
+                    self.canvas_ws.open_document(crel)
+                else:
+                    self.statusBar().showMessage(
+                        f"{crel} 有未保存改动：磁盘卡片路径已级联，保存后请重新打开", 8000)
+                    doc = None
+        if touched:
+            self.canvas_ws.refresh_doc_list()
+        return touched
 
     def _build_toolbar(self):
         """创建独立工具栏 widget（不放进 QMainWindow 区域，改由容器排序：标题栏→工具栏→内容）。"""
@@ -898,9 +1359,9 @@ class MainWindow(QMainWindow):
                                 lambda: self.workspace.setCurrentIndex(WS_CANVAS), "canvas")
         self._btn_ai = _btn(" AI", "AI 管家", lambda: self.workspace.setCurrentIndex(WS_AI), "ai")
         tb.addSeparator()
-        self._btn_watch = _btn(" 监听", "暂停/恢复监听", self._toggle_watch, "watch")
+        self._btn_watch = _btn(" 监听", "暂停/恢复监听（按下=暂停）", self._toggle_watch, "watch")
         self._btn_watch.setCheckable(True)
-        self._btn_watch.setChecked(True)
+        self._btn_watch.setChecked(False)     # 初态：监听运行中（原 True 与行为相反）
         tb.addSeparator()
         _btn(" 审阅", "打开审阅队列", self.open_review, "review")
         _btn(" 设置", "AI Provider / 密钥 / 索引维护", self._settings_dialog, "settings")
@@ -1303,7 +1764,7 @@ class MainWindow(QMainWindow):
 
         # 操作行：应用润色（生成结果后的动作）
         acts = QHBoxLayout()
-        self._ai_apply = QPushButton("应用润色到笔记")
+        self._ai_apply = QPushButton("润色笔记")
         self._ai_apply.setEnabled(False)
         self._ai_apply.clicked.connect(self._ai_apply_polish)
         acts.addWidget(self._ai_apply)
@@ -1902,7 +2363,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("正在停止导入…")
 
     def _toggle_watch(self):
-        self.statusBar().showMessage("监听已暂停" if self._btn_watch.isChecked() else "监听已恢复")
+        """监听开关接真（M-D）：dropbox 自动入库 + vault 磁盘监听同起同停。"""
+        checked = self._btn_watch.isChecked()      # 按下=暂停（文案同步）
+        try:
+            if checked:
+                self.watcher.stop()
+                self.vault_watch.stop()
+            else:
+                self.watcher.start()
+                self.vault_watch.start()
+        except Exception as e:
+            self._append_log(f"⚠ 监听切换失败：{e}")
+        self.statusBar().showMessage(
+            "监听已暂停" if checked else "监听已恢复", 3000)
 
     # ---------- 设置（AI Provider / 索引维护） ----------
     def _settings_dialog(self):
@@ -1943,18 +2416,31 @@ class MainWindow(QMainWindow):
         form.addRow("OpenAI兼容 模型：", amodel_ed)
         form.addRow("Ollama 地址：", ourl_ed)
         form.addRow("Ollama 模型：", omod_ed)
-        # ---- 数据位置 ----
+        # ---- 数据位置：两行两入口（数据根只管索引/收件箱/导出；vault 可独立指位）----
         loc_box = QHBoxLayout()
-        loc_lbl = QLabel(f"数据根：{settings.DATA_ROOT}\n"
-                         f"知识库：{settings.DEFAULT_VAULT_PATH}")
-        loc_lbl.setStyleSheet("color:#5f6368;")
-        b_loc = QPushButton("更改位置…")
+        self._root_lbl = QLabel(str(settings.DATA_ROOT))
+        self._root_lbl.setStyleSheet("color:#5f6368;")
+        self._root_lbl.setToolTip("索引库 kms.db / dropbox 收件箱 / exports 导出所在目录")
+        b_loc = QPushButton("更改…")
         b_loc.clicked.connect(self._change_data_root)
-        loc_box.addWidget(loc_lbl, 1)
+        loc_box.addWidget(self._root_lbl, 1)
         loc_box.addWidget(b_loc, 0)
-        form.addRow("数据位置：", loc_box)
+        form.addRow("数据根（索引/收录/导出）：", loc_box)
+
+        vault_box = QHBoxLayout()
+        self._vault_lbl = QLabel(str(settings.DEFAULT_VAULT_PATH))
+        self._vault_lbl.setStyleSheet("color:#5f6368;")
+        b_vault = QPushButton("指向现成库…")
+        b_vault.clicked.connect(self._change_vault_path)
+        vault_box.addWidget(self._vault_lbl, 1)
+        vault_box.addWidget(b_vault, 0)
+        form.addRow("知识库（Vault）目录：", vault_box)
+        self._sync_location_labels()        # 打开面板即如实反映"生效值 + 待重启值"
+
         hint = QLabel("⚠ 密钥以明文存于 .env；判断层规则分类器不需要任何密钥。"
-                      "更改数据位置需重启生效；vault 为纯 Markdown，可随时整体迁移。")
+                      "改动均需重启生效。想让 KMS 直接使用现有笔记库（如 Obsidian 库），"
+                      "用「知识库目录 → 指向现成库」——那只改指针不搬文件，重启后用"
+                      "资源管理器对库内笔记一键全部收录；数据根迁移才会搬运 vault/dropbox 文件。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#9a6b00;")
         form.addRow(hint)
@@ -2005,6 +2491,84 @@ class MainWindow(QMainWindow):
         self._append_log(f"⚙ 设置已保存（写入 .env）· 当前生效生成后端：{p.name}")
         self.statusBar().showMessage(f"生成后端：{p.name}", 4000)
 
+    # ---------- 路径显示诚实化：生效值 + 待重启生效值 同时摊开 ----------
+    def _env_val(self, key: str) -> str:
+        """现读 .env 覆盖层（settings._env 是启动定格，不随写入刷新）。"""
+        try:
+            return str(settings._load_env().get(key) or "").strip()
+        except OSError:
+            return ""
+
+    def _sync_location_labels(self):
+        """刷新设置面板两行路径：与 .env 待生效值不一致时，明确标注"⚡重启后生效"。"""
+        if getattr(self, "_root_lbl", None) is None:
+            return
+        txt = str(settings.DATA_ROOT)
+        pend = self._env_val("KMS_DATA_ROOT")
+        if pend and Path(pend).expanduser() != Path(settings.DATA_ROOT).resolve():
+            txt += f"\n⚡ 重启后生效：{pend}"
+        self._root_lbl.setText(txt)
+
+        cur_v = Path(settings.DEFAULT_VAULT_PATH)
+        independent = cur_v != Path(settings.DATA_ROOT) / "vault"
+        txt = str(cur_v) + ("　【独立指位】" if independent else "　【数据根/vault】")
+        pv = self._env_val("KMS_VAULT_PATH")
+        want = Path(pv).expanduser() if pv else Path(settings.DATA_ROOT) / "vault"
+        if want != cur_v:
+            txt += f"\n⚡ 重启后生效：{want}"
+        self._vault_lbl.setText(txt)
+
+    # ---------- 知识库（Vault）目录独立指位 ----------
+    def _set_vault_env(self, path) -> None:
+        """写 .env 的 KMS_VAULT_PATH（None=写空值恢复默认 数据根/vault）。无对话框，探针可直调。
+        斜杠风格（as_posix）与 README 示例一致，Path 读取时两种分隔符均合法。"""
+        settings.update_env_values(
+            {"KMS_VAULT_PATH": Path(path).as_posix() if path else ""})
+
+    def _change_vault_path(self):
+        """知识库目录「指向现成库…」：只改指针不搬文件，重启生效。"""
+        from PySide6.QtWidgets import QFileDialog
+        cur_v = Path(settings.DEFAULT_VAULT_PATH)
+        start = str(cur_v.parent if cur_v.parent != cur_v else cur_v)
+        new = QFileDialog.getExistingDirectory(self, "选择现成知识库（如 Obsidian 库）", start)
+        if not new:
+            return
+        dst = Path(new).expanduser()
+        if not dst.is_dir():
+            QMessageBox.warning(self, "目录不可用", str(dst))
+            return
+        nested = (dst / "vault").is_dir()
+        msg = (f"知识库（Vault）将指向：\n{dst}\n\n"
+               "「采纳」= 只改指针，不搬运任何文件。当前知识库的旧内容留在原处：\n"
+               f"{cur_v}\n"
+               "重启后打开资源管理器，新库内笔记会以「待收录」出现，底部一键全部收录；"
+               "如需把旧库并入新库，请重启前自行移动文件。")
+        if nested:
+            msg += ("\n\n⚠ 注意：所选目录下已有 vault/ 子目录——"
+                    "知识库将指向外层，该子目录里的文件改由外层统一管理。")
+        box = QMessageBox(QMessageBox.Icon.Question, "指向现成知识库", msg,
+                          QMessageBox.StandardButton.Yes
+                          | QMessageBox.StandardButton.No
+                          | QMessageBox.StandardButton.Cancel, self)
+        box.button(QMessageBox.StandardButton.Yes).setText("采纳此目录")
+        box.button(QMessageBox.StandardButton.No).setText("恢复默认(数据根/vault)")
+        box.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        ch = box.exec()
+        if ch == QMessageBox.StandardButton.Cancel:
+            return
+        try:
+            self._set_vault_env(dst if ch == QMessageBox.StandardButton.Yes else None)
+        except OSError as e:
+            QMessageBox.warning(self, "写入失败", f"无法写 .env：{e}")
+            return
+        target = dst if ch == QMessageBox.StandardButton.Yes else settings.DATA_ROOT / "vault"
+        self._sync_location_labels()          # 面板立刻反映"待重启生效"新值
+        self._append_log(f"📦 知识库目录已指向 {target}（重启生效）")
+        QMessageBox.information(
+            self, "已设置",
+            "知识库目录已写入 .env，重启应用后生效。\n"
+            "重启后旧知识库的索引条目将失效——新库用资源管理器「全部收录」重建即可。")
+
     def _change_data_root(self):
         """更改数据根：写 .env(KMS_DATA_ROOT)，可选迁移 vault/dropbox。重启生效。"""
         from PySide6.QtWidgets import QFileDialog
@@ -2018,10 +2582,17 @@ class MainWindow(QMainWindow):
         if dst == cur.resolve():
             self.statusBar().showMessage("新位置与当前相同", 2500)
             return
+        vault_indep = settings.DEFAULT_VAULT_PATH != cur / "vault"
+        extra = ("⚠ 注意：数据根模式下知识库固定位于「<新根>/vault」子目录。"
+                 "若想直接使用所选目录本身（如现成笔记库），请取消并改用"
+                 "「知识库目录 → 指向现成库」。")
+        if vault_indep:
+            extra = (f"知识库为独立指位（{settings.DEFAULT_VAULT_PATH}），"
+                     "不随数据根迁移。")
         answer = QMessageBox.question(
             self, "迁移数据",
             f"数据根将改为：\n{dst}\n\n要把现有知识文件（vault / dropbox）移动过去吗？\n"
-            "索引库无需迁移——重启后启动对账会自动重建。",
+            "索引库无需迁移——重启后启动对账会自动重建。\n" + extra,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes)
@@ -2035,12 +2606,22 @@ class MainWindow(QMainWindow):
                 return
             failed = []
             for name in ("vault", "dropbox"):
+                if name == "vault" and vault_indep:
+                    continue              # 独立指位的库不搬（它不在数据根下）
                 src_item = cur / name
-                if src_item.exists():
-                    try:
-                        shutil.move(str(src_item), str(dst / name))
-                    except OSError as e:
-                        failed.append(f"{name}: {e}")
+                if not src_item.exists():
+                    continue
+                if name == "vault" and (dst / "vault").exists():
+                    QMessageBox.warning(
+                        self, "目标已有 vault 子目录",
+                        f"{dst / 'vault'} 已存在——为避免嵌套成 vault/vault，"
+                        "已跳过知识库迁移（仅移动 dropbox）。请自行合并两者，"
+                        "或改用「知识库目录 → 指向现成库」。")
+                    continue
+                try:
+                    shutil.move(str(src_item), str(dst / name))
+                except OSError as e:
+                    failed.append(f"{name}: {e}")
             if failed:
                 go = QMessageBox.question(
                     self, "迁移不完整",
@@ -2051,10 +2632,11 @@ class MainWindow(QMainWindow):
                 if go != QMessageBox.StandardButton.Yes:
                     return
         try:
-            settings.update_env_values({"KMS_DATA_ROOT": str(dst)})
+            settings.update_env_values({"KMS_DATA_ROOT": dst.as_posix()})
         except OSError as e:
             QMessageBox.warning(self, "写入失败", f"无法写 .env：{e}")
             return
+        self._sync_location_labels()          # 面板立刻反映"待重启生效"新值
         self._append_log(f"📦 数据根已改为 {dst}（重启生效）")
         QMessageBox.information(self, "已设置", "数据位置已写入 .env，重启应用后生效。")
 
@@ -2880,6 +3462,13 @@ class MainWindow(QMainWindow):
             return
         try:
             self.watcher.stop()
+        except Exception:
+            pass
+        try:
+            self.vault_watch.stop()
+        except Exception:
+            pass
+        try:
             self.store.close()
         except Exception:
             pass

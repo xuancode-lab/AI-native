@@ -41,6 +41,22 @@ class TestUpdateEnv(unittest.TestCase):
         self.assertEqual((target / ".env").read_text(encoding="utf-8").strip(),
                          "KMS_PROVIDER_MODE=mock")
 
+    def test_vault_path_replace_and_fallback(self):
+        """KMS_VAULT_PATH：原位替换不产生重复行；写空值保留键行并令 resolve 回落。"""
+        settings.update_env_values({"KMS_VAULT_PATH": "D:/Docs/笔记库"}, self.env)
+        lines = self.env.read_text(encoding="utf-8").splitlines()
+        self.assertEqual([l for l in lines if l.startswith("KMS_VAULT_PATH")],
+                         ["KMS_VAULT_PATH=D:/Docs/笔记库"])
+        got = settings.resolve_vault_path({"KMS_VAULT_PATH": "D:/Docs/笔记库"},
+                                          Path("D:/data"))
+        self.assertEqual(got, Path("D:/Docs/笔记库"))
+        settings.update_env_values({"KMS_VAULT_PATH": ""}, self.env)
+        lines = self.env.read_text(encoding="utf-8").splitlines()
+        self.assertIn("KMS_VAULT_PATH=", lines)   # 键行在、值为空 = 恢复默认语义
+        dr = Path("D:/data")
+        self.assertEqual(settings.resolve_vault_path({"KMS_VAULT_PATH": ""}, dr),
+                         dr / "vault")
+
 
 class TestProviderMode(unittest.TestCase):
     def setUp(self):

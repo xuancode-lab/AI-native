@@ -255,6 +255,105 @@ class SQLiteStore:
         self.conn.commit()
         self._bump()
 
+    def rename_prefix(self, old_prefix: str, new_prefix: str) -> dict:
+        """目录改名/移动与单文件移动的统一路径前缀级联（资源管理器 M-A）。
+
+        old/new 为 vault 相对路径（目录不带尾斜杠；单文件亦可——under_prefix
+        退化为只匹自己）。与 rename_path 的两点刻意差异：
+          ① 文件名 stem 未变 → links.to_target / suggestions.target 都不动；
+          ② suggestions payload 路径键（target_path/canvas_rel/from_rel/to_rel）
+             全 status 一并改写——canvas_edge_map 按 canvas_rel 匹配所有状态
+             还原画布边视觉，漏改 applied 行会静默丢边态。
+        匹配在 Python 侧用 fsindex 纯函数过滤（SQLite LIKE 对 ASCII 大小写
+        不敏感，会误伤同前缀不同写法的目录）。撞名预检 raise（事务未提交，
+        调用方可回滚磁盘侧）。返回 {"files": 迁移行数, "payloads": 改写行数}。
+        """
+        import json as _json
+        from core.storage.fsindex import (normalize_rel, apply_prefix_rename,
+                                          under_prefix)
+        old_prefix = normalize_rel(old_prefix)
+        new_prefix = normalize_rel(new_prefix) if new_prefix else ""
+        self._require_write()
+        if old_prefix == new_prefix:
+            return {"files": 0, "payloads": 0}
+        if under_prefix(new_prefix, old_prefix):
+            raise ValueError(f"不能把 {old_prefix} 套进自己：{new_prefix}")
+        all_paths = {r["path"] for r in
+                     self.conn.execute("SELECT path FROM vault_files")}
+        moved = [(p, apply_prefix_rename(p, old_prefix, new_prefix))
+                 for p in sorted(all_paths)]
+        moved = [(o, n) for o, n in moved if n is not None and n != o]
+        sources = {o for o, _ in moved}
+        clash = [n for _, n in moved if n in all_paths and n not in sources]
+        if clash:
+            raise ValueError(f"目标路径已存在: {sorted(clash)[:3]}")
+        tables = [("vault_files", "path"), ("atoms", "file_path"),
+                  ("links", "from_path"), ("classifications", "file_path"),
+                  ("snapshots", "file_path"), ("suggestions", "file_path")]
+        if self.fts_ok:
+            tables.append(("notes_fts", "path"))
+        for table, col in tables:
+            ups = []
+            for r in self.conn.execute(
+                    f"SELECT DISTINCT {col} AS v FROM {table}").fetchall():
+                nv = apply_prefix_rename(r["v"], old_prefix, new_prefix)
+                if nv is not None and nv != r["v"]:
+                    ups.append((nv, r["v"]))
+            if ups:
+                self.conn.executemany(
+                    f"UPDATE {table} SET {col}=? WHERE {col}=?", ups)
+        pl_n = 0
+        keys = ("target_path", "canvas_rel", "from_rel", "to_rel")
+        rows = self.conn.execute("SELECT id, payload FROM suggestions").fetchall()
+        for row in rows:
+            try:
+                pl = _json.loads(row["payload"] or "{}")
+            except _json.JSONDecodeError:
+                continue                       # 坏 payload 不动不报错（只级联自己命中的）
+            if not isinstance(pl, dict):
+                continue
+            changed = False
+            for k in keys:
+                v = pl.get(k)
+                if isinstance(v, str):
+                    nv = apply_prefix_rename(v, old_prefix, new_prefix)
+                    if nv is not None and nv != v:
+                        pl[k] = nv
+                        changed = True
+            if changed:
+                self.conn.execute("UPDATE suggestions SET payload=? WHERE id=?",
+                                  (_json.dumps(pl, ensure_ascii=False), row["id"]))
+                pl_n += 1
+        self.conn.commit()
+        self._bump()
+        return {"files": len(moved), "payloads": pl_n}
+
+    def delete_paths(self, rels: list[str]) -> int:
+        """批量删除（文件夹清理）：delete_file 的级联合并为单事务。
+        suggestions 同样是 pending→obsolete 而非删除；.canvas 的
+        canvas_edge_orphan 属 curator payload 语义，由调用方逐文件处理。"""
+        import os
+        self._require_write()
+        if not rels:
+            return 0
+        tables = [("vault_files", "path"), ("atoms", "file_path"),
+                  ("links", "from_path"), ("classifications", "file_path"),
+                  ("snapshots", "file_path")]
+        if self.fts_ok:
+            tables.append(("notes_fts", "path"))
+        for path in rels:
+            for table, col in tables:
+                self.conn.execute(f"DELETE FROM {table} WHERE {col}=?", (path,))
+            stem = os.path.splitext(os.path.basename(path))[0]
+            self.conn.execute(
+                "UPDATE suggestions SET status='obsolete', "
+                "resolved_at=datetime('now','localtime') "
+                "WHERE status='pending' AND (file_path=? OR (kind IN ('wikilink','edge') AND target=?))",
+                (path, stem))
+        self.conn.commit()
+        self._bump()
+        return len(rels)
+
     def delete_file(self, path: str) -> None:
         """删除笔记：清理其在所有表中的记录，失效其相关建议。"""
         self._require_write()

@@ -167,38 +167,49 @@ class IngestPipeline:
                 self.store.log("error", "batch", f"{p.name}: {e}")
         return {"ok": True, **stats, "details": details}
 
+    def register_existing(self, rel: str) -> dict:
+        """就地登记 vault 内已存在的 .md（资源管理器"收录"原语，M-A）。
+
+        ⚠ 与 ingest_file 的本质区别：ingest_file 清洗后落盘到
+        {topic}/{title}.md 新位置——拿它处理 vault 内文件会得到第二份副本；
+        本方法只补 DB 登记（分类走缓存优先），文件原地不动。
+        status: registered|already|ghost|duplicate|empty。
+        """
+        if self.store.file_exists(rel):
+            return {"ok": True, "status": "already"}
+        full = self.vault.vault_path / rel
+        if not full.exists():
+            return {"ok": False, "status": "ghost"}
+        content = self.vault.read_note(rel)
+        if not content.strip():
+            return {"ok": False, "status": "empty"}
+        title = Vault.extract_title(content) or self.cleaner.extract_title_hint(content)
+        dedup_key = Vault.make_dedup_key(content)
+        if self.store.find_by_dedup(dedup_key):      # 同内容不同路径：不重复建原子
+            return {"ok": False, "status": "duplicate"}
+        cls = self.router.classify(content, title, rel_path=rel)
+        atoms = self.extractor.extract_all(content)
+        self.store.upsert_file(rel, title, cls["topic"], cls["type"],
+                               cls["priority"], dedup_key, os.path.getmtime(str(full)))
+        self.store.add_atoms(rel, atoms)
+        self.store.add_link(rel, cls["topic"])
+        for target in Vault.extract_wikilinks(content):
+            self.store.add_link(rel, target)
+        self.store.save_classification(rel, cls)
+        self.store.add_atoms(rel, [{"kind": "topic", "value": cls["topic"], "weight": 1.0}])
+        self.store.index_note_tokens(rel, content)
+        return {"ok": True, "status": "registered", "topic": cls["topic"]}
+
     def reindex(self) -> dict:
         """从 Vault 现有 .md 文件重建索引（DB 丢失/损坏后恢复用）。
 
-        已有分类缓存的跳过判断（不重读上下文），只补登记与原子。
+        单文件逻辑复用 register_existing（就地登记，不搬运）。
         """
         stats = {"scanned": 0, "indexed": 0, "skipped": 0}
         for rel in self.vault.all_markdown_files():
             stats["scanned"] += 1
-            if self.store.file_exists(rel):
-                stats["skipped"] += 1
-                continue
-            content = self.vault.read_note(rel)
-            title = Vault.extract_title(content) or self.cleaner.extract_title_hint(content)
-            dedup_key = Vault.make_dedup_key(content)
-            # 已有该指纹的登记 → 只跳过（不同路径同内容不重复建原子）
-            if self.store.find_by_dedup(dedup_key):
-                stats["skipped"] += 1
-                continue
-            # 分类：优先按路径已有缓存，否则现场判断一次并缓存
-            cls = self.router.classify(content, title, rel_path=rel)
-            atoms = self.extractor.extract_all(content)
-            full = self.vault.vault_path / rel
-            self.store.upsert_file(rel, title, cls["topic"], cls["type"],
-                                   cls["priority"], dedup_key, os.path.getmtime(str(full)))
-            self.store.add_atoms(rel, atoms)
-            self.store.add_link(rel, cls["topic"])
-            for target in Vault.extract_wikilinks(content):
-                self.store.add_link(rel, target)
-            self.store.save_classification(rel, cls)
-            self.store.add_atoms(rel, [{"kind": "topic", "value": cls["topic"], "weight": 1.0}])
-            self.store.index_note_tokens(rel, content)
-            stats["indexed"] += 1
+            res = self.register_existing(rel)
+            stats["indexed" if res["status"] == "registered" else "skipped"] += 1
         self.store.log("info", "reindex", str(stats))
         return stats
 
