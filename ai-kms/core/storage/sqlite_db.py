@@ -476,6 +476,12 @@ class SQLiteStore:
             "WHERE id=?", (status, sid))
         self.conn.commit()
 
+    def delete_suggestion(self, sid: int) -> None:
+        """物理删行（白板手绘边被删时的伴生 pending 建议：自绘意图未进决策不留坟场）。"""
+        self._require_write()
+        self.conn.execute("DELETE FROM suggestions WHERE id=?", (sid,))
+        self.conn.commit()
+
     def count_pending(self, kind: str | None = None) -> int:
         q = "SELECT COUNT(*) c FROM suggestions WHERE status='pending'"
         if kind:

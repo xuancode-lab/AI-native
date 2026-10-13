@@ -39,6 +39,11 @@ class Vault:
         return [p.relative_to(self.vault_path).as_posix()
                 for p in self.vault_path.rglob("*.md") if p.is_file()]
 
+    def list_canvas_files(self):
+        """白板文档（.canvas）只列不摄：不进 vault_files、不走 ingest。"""
+        return sorted(p.relative_to(self.vault_path).as_posix()
+                      for p in self.vault_path.rglob("*.canvas") if p.is_file())
+
     def rel_path_for(self, full_path) -> str:
         full = Path(full_path).resolve()
         return full.relative_to(self.vault_path.resolve()).as_posix()

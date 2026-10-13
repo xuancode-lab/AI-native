@@ -26,6 +26,11 @@ suggestion payload schema（唯一定义处）：
       shared_keywords: [..], title_shared: int,
       tier: "dashed"(虚线升实线)|"rescue"(孤立救援)|"library"(全库单词对),
       deg_from, deg_to }                           # pair 两端在图中的度数
+  kind="canvas_edge"（白板手绘边 A→B；payload 兼容 wikilink 段模式，复用 _apply_wikilink）:
+    { source: "canvas", target_title(=对面 B 的 stem), target_path(=B),
+      content_fp(被改侧 A), insert_at: null, anchor: null, safe: false,
+      canvas_rel, edge_id, from_rel, to_rel }
+    # 被改侧=画的尾侧 A：方向是人明示的承诺，不套 edge 的 deg 定序
 """
 from __future__ import annotations
 
@@ -45,6 +50,7 @@ MAX_SUGG_PER_NOTE = 5          # 单篇一次扫描的建议上限
 MAX_EDGE_PER_NODE = 3          # 发现关联：每节点最多建议数（两端都计数）
 MAX_EDGE_PAIRS = 500           # 发现关联：单次扫描全局建议上限
 _EDGE_HUB_CAP = 60             # 关键词波及文件数超此值视为 hub 词，不计入 shared（对齐 engine）
+CANVAS_EDGE = "canvas_edge"    # 白板手绘边的建议 kind（schema 见模块头）
 
 
 class Curator:
@@ -421,6 +427,123 @@ class Curator:
         added = self.store.add_suggestions(rows) if rows else 0
         return {"scanned": len(batch), "added": added, "remaining": len(rest)}
 
+    # ================= 白板手绘边桥（画布→审阅队列→采纳写回双链） =================
+    def canvas_edge_add(self, canvas_rel: str, edge_id: str,
+                        from_rel: str, to_rel: str,
+                        source: str = "canvas",
+                        shared_keywords: list[str] | None = None) -> dict | None:
+        """用户在画布画了 A→B：落一条 pending 建议，被改侧=尾侧 A（人明示方向）。
+
+        source："canvas"=手绘 / "canvas_ai"=画布内发现关联（阶段 C5）；
+        shared_keywords 仅 AI 建议携带（进 payload 供审阅面板展示证据词）。
+        前置校验仿 edges_scan 防线：两端须已入库（get_file）、自环拒、
+        links 表已有任一向实线 → already_linked（边只是视觉，不出建议）。
+        UNIQUE(kind,file_path,target) 冲突交 add_suggestions：pending 刷 payload，
+        applied/skipped/obsolete 不复活。返回 None | {"status":"already_linked"} |
+        {"sid": int, "status": str}。
+        """
+        if not all((canvas_rel, edge_id, from_rel, to_rel)) or from_rel == to_rel:
+            return None
+        if self.store.get_file(from_rel) is None or self.store.get_file(to_rel) is None:
+            return None
+        content = self.vault.read_note(from_rel)
+        if not content:                       # 被改侧空/已删：无可写入对象
+            return None
+        stem_to = _stem(to_rel)
+        if self.store.conn.execute(
+                "SELECT 1 FROM links WHERE (from_path=? AND to_target=?)"
+                "   OR (from_path=? AND to_target=?) LIMIT 1",
+                (from_rel, stem_to, to_rel, _stem(from_rel))).fetchone():
+            return {"status": "already_linked"}
+        pl = {"source": source, "target_title": stem_to, "target_path": to_rel,
+              "content_fp": Vault.make_dedup_key(content),
+              "insert_at": None, "anchor": None, "safe": False,
+              "canvas_rel": canvas_rel, "edge_id": edge_id,
+              "from_rel": from_rel, "to_rel": to_rel}
+        if shared_keywords:
+            pl["shared_keywords"] = shared_keywords
+        conf = 0.7 if source == "canvas_ai" else 1.0   # AI 建议非人明示，置信打折
+        self.store.add_suggestions([{
+            "kind": CANVAS_EDGE, "file_path": from_rel, "target": stem_to,
+            "confidence": conf, "payload": pl}])
+        got = self.store.conn.execute(
+            "SELECT id, status FROM suggestions WHERE kind=? AND file_path=? AND target=?",
+            (CANVAS_EDGE, from_rel, stem_to)).fetchone()
+        return {"sid": got["id"], "status": got["status"]}
+
+    def canvas_suggest(self, doc_cards: list[tuple[str, list[str]]],
+                       existing_pairs: set, limit: int = 8) -> list[dict]:
+        """画布内"发现关联"：对摆上画布的笔记卡跑 edge_candidates，返回可连线候选。
+
+        doc_cards：rel → 该 rel 在画布上的卡 id 列表（调用方按文档序去重）。
+        existing_pairs：画布已有边覆盖的 frozenset{(rel_a, rel_b)}，跳过不重复建议。
+        防噪全继承 edge_candidates（dashed/rescue 门槛、歧义标题、hub 词、已实链）。
+        返回按 conf 降序、截 limit 的
+        [{from_rel,to_rel,from_node,to_node,conf,kws,tier}]；≤1 篇可连笔记 → []。
+        """
+        id_of = {r: ids[0] for r, ids in doc_cards if ids}
+        rels = list(id_of)
+        if len(rels) < 2:
+            return []
+        pairs = self.edge_candidates({"type": "note", "paths": rels}, all_pairs=True)
+        pairs = sorted(pairs, key=lambda d: -d["conf"])
+        out = []
+        for d in pairs:
+            if d["a"] not in id_of or d["b"] not in id_of:
+                continue
+            if frozenset((d["a"], d["b"])) in existing_pairs:
+                continue
+            # AI 建议没有人画方向 → 沿用 edges_scan 定序：被改侧=低度数侧（防 hub 膨胀）
+            a, b = d["a"], d["b"]
+            if (d["deg_b"], b) < (d["deg_a"], a):
+                a, b = b, a
+            out.append({"from_rel": a, "to_rel": b,
+                        "from_node": id_of[a], "to_node": id_of[b],
+                        "conf": d["conf"], "kws": d["kws"], "tier": d["tier"]})
+            if len(out) >= limit:
+                break
+        return out
+
+    def canvas_edge_map(self, canvas_rel: str) -> dict[str, dict]:
+        """edge_id → {sid,status,from_rel,to_rel}：重开画布还原装边视觉态（含已处理行）。"""
+        out: dict[str, dict] = {}
+        for r in self.store.conn.execute(
+                "SELECT id, status, payload FROM suggestions WHERE kind=?",
+                (CANVAS_EDGE,)):
+            try:
+                pl = json.loads(r["payload"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            if pl.get("canvas_rel") == canvas_rel and pl.get("edge_id"):
+                out[pl["edge_id"]] = {"sid": r["id"], "status": r["status"],
+                                      "from_rel": pl.get("from_rel"),
+                                      "to_rel": pl.get("to_rel"),
+                                      "source": pl.get("source", "canvas"),
+                                      "kws": pl.get("shared_keywords") or []}
+        return out
+
+    def canvas_edge_remove(self, sid: int) -> str:
+        """删边/undo 时处置伴生建议：pending→删行（草稿意图不留坟场）；
+        已决策(applied/skipped/obsolete)→保留审计链，绝不反向删笔记里已生效的双链。"""
+        row = self.store.get_suggestion(sid)
+        if row is None or row["kind"] != CANVAS_EDGE:
+            return "missing"
+        if row["status"] == "pending":
+            self.store.delete_suggestion(sid)
+            return "deleted"
+        return "kept"
+
+    def canvas_edge_orphan(self, canvas_rel: str) -> int:
+        """删除画布文件：该画布全部 pending 手绘边建议作废（applied 是决策史，不动）。"""
+        like = f'%"canvas_rel": {json.dumps(canvas_rel, ensure_ascii=False)}%'
+        cur = self.store.conn.execute(
+            "UPDATE suggestions SET status='obsolete', "
+            "resolved_at=datetime('now','localtime') "
+            "WHERE kind=? AND status='pending' AND payload LIKE ?",
+            (CANVAS_EDGE, like))
+        self.store.conn.commit()
+        return cur.rowcount
+
     # ================= 应用（写回） =================
     def apply_suggestion(self, sid: int, target_override: str | None = None) -> dict:
         """采纳一条建议。失败不写库、行保持 pending。
@@ -437,6 +560,9 @@ class Curator:
             if row["kind"] == "edge":
                 # 发现关联：payload 兼容 wikilink 段模式，写进笔记成真双链
                 return self._apply_wikilink(row, target_override, reason="关联确认")
+            if row["kind"] == CANVAS_EDGE:
+                # 白板手绘边：采纳 = 在尾侧笔记"## 相关"追加 [[目标]]
+                return self._apply_wikilink(row, target_override, reason="画布关联确认")
             if row["kind"] == "topic":
                 return self._apply_topic(row, target_override)
         except Exception as e:

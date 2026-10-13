@@ -35,10 +35,13 @@ class _Handler(FileSystemEventHandler):
             return
 
         try:
-            if p.suffix.lower() in (".md", ".txt", ".rst"):
+            suffix = p.suffix.lower()
+            if suffix in (".md", ".txt", ".rst"):
                 res = self.pipeline.ingest_file(p)
                 self.store.log("info", "watcher", f"auto-ingest {p.name} → {res}")
                 # 收录完成的素材原文件可移至 done（可选保留策略）
+            elif suffix == ".canvas":
+                pass    # 白板文档只列不摄（编辑器直接读写文件，监听器完全忽略）
             else:
                 # 非 md：作为附件收集到同名 .md 引用（MVP 先仅记录）
                 self.store.log("info", "watcher", f"non-md dropped: {p.name}")

@@ -264,12 +264,15 @@ ICON_DIR = Path(__file__).parent / "icons"
 ICON_GRAY = "#5f6368"
 ICON_BLUE = "#1a73e8"
 TOPIC_ROLE = Qt.ItemDataRole.UserRole + 1   # 文件夹项存分类名（与笔记 path 角色区分）
+CANVAS_FOLDER = "__canvas_folder__"         # TOPIC_ROLE 值：白板伪文件夹标记
 # 预览渲染：[[目标#锚|别名]] → 可点链接；代码围栏/行内代码内的不替换
 _WIKI_FULL_RE = re.compile(r"\[\[([^\[\]|#]+?)(?:#[^\[\]|]*)?(?:\|([^\[\]]*))?\]\]")
 _MD_PROTECT_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]+`)", re.S)
 IMPORT_BATCH = 10                           # 分批导入：每个 tick 处理的文件数
 CURATOR_BATCH = 20                          # 策展扫描：每个 tick 处理的笔记数
 APPLY_BATCH = 1                             # 批量采纳：每个 tick 应用的建议数（含写盘）
+# 工作区页序：插页请动这里，勿再写魔数（L868/2058 等历史硬编码已全部替换）
+WS_NOTES, WS_GRAPH, WS_CANVAS, WS_AI = 0, 1, 2, 3
 
 
 def _render_svg(name: str, color: str, size: int) -> "QPixmap":
@@ -328,15 +331,33 @@ class ActivityButton(QToolButton):
 
 
 class NavTree(QTreeView):
-    """左侧导航树：接受从资源管理器拖入的文件/文件夹 URL，仅 DropOnly（禁内部重排）。"""
+    """左侧导航树：接受 explorer 拖入的 URL，并支持把笔记/白板拖出到画布。
+    内部重排仍被禁：dragEnter/dropEvent 只认 urls，自定义 mime 拖回自己会被 ignore。"""
 
     dropped = Signal(list)          # list[str] 本地路径
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDropIndicatorShown(False)
+
+    def startDrag(self, supported_actions):
+        """拖出：笔记行（UserRole=path）→ 自定义 mime + text(rel)。白板行禁拖。"""
+        idx = self.currentIndex()
+        rel = idx.data(Qt.ItemDataRole.UserRole) if idx.isValid() else None
+        if not isinstance(rel, str) or not rel or rel.lower().endswith(".canvas"):
+            return
+        from app.ui.canvas import KMS_NOTE_MIME
+        from PySide6.QtCore import QMimeData
+        from PySide6.QtGui import QDrag
+        md = QMimeData()
+        md.setData(KMS_NOTE_MIME, rel.encode("utf-8"))
+        md.setText(rel)
+        drag = QDrag(self)
+        drag.setMimeData(md)
+        drag.exec(Qt.DropAction.CopyAction)
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
@@ -671,17 +692,23 @@ class MainWindow(QMainWindow):
         self.nav_tree.customContextMenuRequested.connect(self._tree_context_menu)
         self.nav_tree.setVisible(False)      # 默认折叠
 
-        # Ctrl+S 保存快捷键（笔记区）
+        # Ctrl+S 保存快捷键：分发器（白板页存画布，其余存笔记）
         from PySide6.QtGui import QShortcut
         # 标准键：Windows=Ctrl，macOS 自动映射为 ⌘（平台预埋）
-        QShortcut(QKeySequence(QKeySequence.StandardKey.Save), self, activated=self._save_note)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Save), self, activated=self._on_save_shortcut)
         QShortcut(QKeySequence(QKeySequence.StandardKey.New), self, activated=self._new_note)
         QShortcut(QKeySequence(QKeySequence.StandardKey.Close), self, activated=self._close_note)
 
-        # 中间：工作区（堆叠）
+        # 中间：工作区（堆叠）：笔记 | 图谱 | 白板 | AI
+        from app.ui.canvas import CanvasWorkspace
         self.workspace = QStackedWidget()
         self.workspace.addWidget(self._build_notes_workspace())
         self.workspace.addWidget(self._build_graph_workspace())
+        self.canvas_ws = CanvasWorkspace(self.store, self.vault,
+                                         on_open=self._open_note,
+                                         curator=self.curator,
+                                         on_docs_changed=self._refresh_tree)
+        self.workspace.addWidget(self.canvas_ws)
         self.workspace.addWidget(self._build_ai_workspace())
 
         # 右侧：属性栏（可折叠）
@@ -865,9 +892,11 @@ class MainWindow(QMainWindow):
         self._btn_import = _btn(" 导入文件夹", "批量导入目录中的 .md/.txt/.rst（也可直接拖进左侧树）",
                                 self._import_folder_dialog, "import")
         tb.addSeparator()
-        self._btn_notes = _btn(" 笔记", "笔记工作区", lambda: self.workspace.setCurrentIndex(0), "notes")
-        self._btn_graph = _btn(" 图谱", "知识图谱", lambda: self.workspace.setCurrentIndex(1), "graph")
-        self._btn_ai = _btn(" AI", "AI 管家", lambda: self.workspace.setCurrentIndex(2), "ai")
+        self._btn_notes = _btn(" 笔记", "笔记工作区", lambda: self.workspace.setCurrentIndex(WS_NOTES), "notes")
+        self._btn_graph = _btn(" 图谱", "知识图谱", lambda: self.workspace.setCurrentIndex(WS_GRAPH), "graph")
+        self._btn_canvas = _btn(" 白板", "白板画布：连线即沉淀为图谱关联（.canvas 与 Obsidian 互通）",
+                                lambda: self.workspace.setCurrentIndex(WS_CANVAS), "canvas")
+        self._btn_ai = _btn(" AI", "AI 管家", lambda: self.workspace.setCurrentIndex(WS_AI), "ai")
         tb.addSeparator()
         self._btn_watch = _btn(" 监听", "暂停/恢复监听", self._toggle_watch, "watch")
         self._btn_watch.setCheckable(True)
@@ -1091,6 +1120,15 @@ class MainWindow(QMainWindow):
         self._props_related.clear()
         self._snap_list.clear()
 
+    def _on_save_shortcut(self):
+        """全局 Ctrl+S 分发：白板页 → 存画布；其余 → 存笔记（既有行为不变）。"""
+        ws = getattr(self, "canvas_ws", None)
+        if ws is not None and self.workspace.currentWidget() is ws:
+            if ws.doc is not None:
+                ws.save_current()
+            return
+        self._save_note()
+
     def _save_note(self):
         rel = self._current_note()
         if not rel:
@@ -1172,9 +1210,13 @@ class MainWindow(QMainWindow):
 
     def _on_workspace_changed(self, idx: int):
         if hasattr(self, "_graph_view"):
-            self._graph_view.set_animation_enabled(idx == 1)
-            if idx == 1:
+            self._graph_view.set_animation_enabled(idx == WS_GRAPH)
+            if idx == WS_GRAPH:
                 self._graph_view.setFocus()
+        if idx == WS_CANVAS:
+            self.canvas_ws.sync_disk_quiet()       # 外部改盘且本地干净 → 静默重载
+            self.canvas_ws.refresh_card_labels()
+            self.canvas_ws.view.setFocus()
 
     def _build_ai_workspace(self) -> QWidget:
         """聊天式布局：顶部配置行 → 中部输出占满 → 底部输入+发送。"""
@@ -1349,7 +1391,21 @@ class MainWindow(QMainWindow):
 
     # ---------- 行为 ----------
     def _refresh_tree(self):
-        """重建左侧导航树：按分类层 taxonomy 分组（内置+自定义分类+已有笔记主题）。"""
+        """重建左侧导航树：按分类层 taxonomy 分组（内置+自定义分类+已有笔记主题）。
+        展开状态增量保留：用户折叠/展开的选择跨刷新不变；只有首次出现的分组
+        （如新建的第一个白板）自动展开。"""
+        m0 = self.nav_tree.model()
+        if m0 is None:
+            prev_expanded = prev_seen = None          # 首次构建：全展开（原行为）
+        else:
+            r0 = m0.invisibleRootItem()
+            prev_expanded, prev_seen = set(), set()
+            for i in range(r0.rowCount()):
+                it = r0.child(i)
+                key = it.data(TOPIC_ROLE) or it.text()
+                prev_seen.add(key)
+                if self.nav_tree.isExpanded(m0.indexFromItem(it)):
+                    prev_expanded.add(key)
         model = QStandardItemModel()
         model.setHorizontalHeaderLabels(["名称"])
         root = model.invisibleRootItem()
@@ -1374,14 +1430,42 @@ class MainWindow(QMainWindow):
                 note_item.setData(f["path"], Qt.ItemDataRole.UserRole)
                 topic_item.appendRow(note_item)
             root.appendRow(topic_item)
+        # 白板分区：.canvas 不入 vault_files、不进 ingest，只列不摄
+        canvases = self.vault.list_canvas_files()
+        if canvases:
+            cw_item = QStandardItem(f"白板 ({len(canvases)})")
+            cw_item.setEditable(False)
+            cw_item.setIcon(_svg_icon("canvas", ICON_BLUE, 16))
+            cw_item.setData(CANVAS_FOLDER, TOPIC_ROLE)
+            for rel in canvases:
+                c_item = QStandardItem(Path(rel).stem)
+                c_item.setEditable(False)
+                c_item.setIcon(_svg_icon("canvas", ICON_GRAY, 16))
+                c_item.setData(rel, Qt.ItemDataRole.UserRole)
+                cw_item.appendRow(c_item)
+            root.appendRow(cw_item)
         self.nav_tree.setModel(model)
-        self.nav_tree.expandAll()
+        exp, seen = set(), set()
+        for i in range(root.rowCount()):
+            it = root.child(i)
+            key = it.data(TOPIC_ROLE) or it.text()
+            seen.add(key)
+            if (prev_seen is None or key in prev_expanded
+                    or key not in prev_seen):
+                self.nav_tree.expand(model.indexFromItem(it))
+                exp.add(key)
+        self._tree_expanded, self._tree_seen = exp, seen
 
     def _on_tree_double_clicked(self, idx):
         model = self.nav_tree.model()
         path = model.data(idx, Qt.ItemDataRole.UserRole)
-        if path:
-            self._open_note(path)
+        if not path:
+            return
+        if str(path).lower().endswith(".canvas"):
+            if self.canvas_ws.open_document(path):
+                self.workspace.setCurrentIndex(WS_CANVAS)
+            return
+        self._open_note(path)
 
     def _tree_context_menu(self, pos):
         from PySide6.QtWidgets import QMenu
@@ -1401,7 +1485,15 @@ class MainWindow(QMainWindow):
         act_new.triggered.connect(self._new_note)
         act_cat = menu.addAction("📁 新建分类…")
         act_cat.triggered.connect(self._new_category)
-        if path:
+        act_canvas = menu.addAction("▦ 新建白板…")
+        act_canvas.triggered.connect(self._new_canvas)
+        if path and str(path).lower().endswith(".canvas"):
+            menu.addSeparator()
+            act_ren = menu.addAction("✎ 重命名白板")
+            act_ren.triggered.connect(lambda: self._rename_canvas(path))
+            act_del = menu.addAction("🗑 删除白板")
+            act_del.triggered.connect(lambda: self._delete_canvas(path))
+        elif path:
             menu.addSeparator()
             act_send = menu.addAction("📌 发送到 AI 管家")
             act_send.triggered.connect(lambda: self._send_to_pilot(path))
@@ -1415,6 +1507,62 @@ class MainWindow(QMainWindow):
             act_delcat = menu.addAction(f"🗑 删除分类「{topic}」")
             act_delcat.triggered.connect(lambda: self._delete_category(topic))
         menu.exec(self.nav_tree.viewport().mapToGlobal(pos))
+
+    # ---------- 白板文件管理（树右键；.canvas 不进 ingest，仅文件系统操作） ----------
+    def _new_canvas(self):
+        if self.canvas_ws.new_document_interactive():
+            self.workspace.setCurrentIndex(WS_CANVAS)
+            self._refresh_tree()
+            self._append_log("▦ 新建白板并打开。")
+
+    def _rename_canvas(self, rel: str):
+        from PySide6.QtWidgets import QInputDialog
+        from core.storage.vault import slugify
+        name, ok = QInputDialog.getText(self, "重命名白板", "新名称：",
+                                        text=Path(rel).stem)
+        if not ok or not name.strip():
+            return
+        parent = rel.rsplit("/", 1)[0] + "/" if "/" in rel else ""
+        new_rel = parent + slugify(name.strip()) + ".canvas"
+        if new_rel == rel:
+            return
+        if (self.vault.vault_path / new_rel).exists():
+            self.statusBar().showMessage(f"已存在：{new_rel}", 3000)
+            return
+        (self.vault.vault_path / rel).rename(self.vault.vault_path / new_rel)
+        self.curator.canvas_edge_orphan(rel)     # 旧路径 pending 作废；applied 留审计
+        was_open = self.canvas_ws.doc and self.canvas_ws.doc.rel_path == rel
+        if was_open:
+            if self.canvas_ws.doc.dirty:
+                self.canvas_ws.doc.rel_path = new_rel      # 未保存内容保住，存盘写到新名
+                self.canvas_ws._edge_state = {}
+                for it in self.canvas_ws.view._edges.values():
+                    it.set_status("")
+                self.canvas_ws._update_title()
+            else:
+                self.canvas_ws.open_document(new_rel)
+        self.canvas_ws.refresh_doc_list()
+        self._refresh_tree()
+        self._append_log(f"✎ 白板重命名：{rel} → {new_rel}")
+
+    def _delete_canvas(self, rel: str):
+        from PySide6.QtWidgets import QMessageBox
+        ans = QMessageBox.question(
+            self, "删除白板",
+            f"删除 {rel}？手绘边产生的待处理建议将一并失效（已采纳的双链不动）。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        if self.canvas_ws.doc and self.canvas_ws.doc.rel_path == rel:
+            if not self.canvas_ws.confirm_discard():
+                return
+            self.canvas_ws.close_document()
+        (self.vault.vault_path / rel).unlink(missing_ok=True)
+        self.curator.canvas_edge_orphan(rel)
+        self.canvas_ws.refresh_doc_list()
+        self._refresh_tree()
+        self._append_log(f"🗑 删除白板：{rel}")
 
     def _new_category(self):
         """新建分类（分类层扩展）：名称 + 可选触发关键词，落 categories 表。"""
@@ -1543,7 +1691,7 @@ class MainWindow(QMainWindow):
         self._note_save_btn.setEnabled(False)
         self._note_close_btn.setEnabled(True)
         self._note_path_lbl.setText(rel_path)
-        self.workspace.setCurrentIndex(0)
+        self.workspace.setCurrentIndex(WS_NOTES)
 
         f = self.store.get_file(rel_path)
         self._props_title.setText(f"📄 {f['title']}")
@@ -2055,7 +2203,7 @@ class MainWindow(QMainWindow):
     def _send_to_pilot(self, path):
         """树右键入口：挂载该笔记并切到 AI 管家工作区。"""
         self._mount_add(path)
-        self.workspace.setCurrentIndex(2)
+        self.workspace.setCurrentIndex(WS_AI)
         self.statusBar().showMessage("已挂载到 AI 管家（chips 点 × 可取消）", 3000)
 
     def _mount_add(self, path):
@@ -2274,7 +2422,8 @@ class MainWindow(QMainWindow):
     # ---------- 审阅队列面板 ----------
     _REV_STATUS_CN = {"pending": "待处理", "applied": "已采纳",
                       "skipped": "已跳过", "obsolete": "已失效"}
-    _REV_KIND_CN = {"wikilink": "双链", "topic": "改分类", "edge": "关联"}
+    _REV_KIND_CN = {"wikilink": "双链", "topic": "改分类", "edge": "关联",
+                    "canvas_edge": "画布关联"}
     _EDGE_TIER_CN = {"dashed": "虚线升实线", "rescue": "孤立救援", "library": "全库对"}
 
     def _build_review_panel(self) -> QWidget:
@@ -2290,6 +2439,7 @@ class MainWindow(QMainWindow):
         self._rev_kind.addItem("双链", "wikilink")
         self._rev_kind.addItem("改分类", "topic")
         self._rev_kind.addItem("关联", "edge")
+        self._rev_kind.addItem("画布关联", "canvas_edge")
         self._rev_status = FlatCombo()
         for key, cn in self._REV_STATUS_CN.items():   # dict 是 英文key→中文label
             self._rev_status.addItem(cn, key)
@@ -2358,6 +2508,11 @@ class MainWindow(QMainWindow):
                 sug = (f"相关段追加 [[{s['target']}]]"
                        f"（{self._EDGE_TIER_CN.get(pl.get('tier'), '?')}"
                        + (f" · 共享 {kws}" if kws else "") + "）")
+            elif s["kind"] == "canvas_edge":
+                kws = "、".join((pl.get("shared_keywords") or [])[:3])
+                src_cn = "AI 建议" if pl.get("source") == "canvas_ai" else "来自白板"
+                sug = (f"相关段追加 [[{s['target']}]]（"
+                       + (f"共享 {kws} · " if kws else "") + f"{src_cn}）")
             else:
                 sug = f"[[{s['target']}]]"
                 if pl.get("insert_at") is None:
@@ -2384,6 +2539,10 @@ class MainWindow(QMainWindow):
             f"待处理 {self.store.count_pending()} · 本页 {len(rows)}")
         self.output_tabs.setTabText(
             self._review_tab_idx, f"审阅队列({self.store.count_pending()})")
+        # 审阅动作（采纳/跳过/清理）可能改了画布手绘边的建议状态 → 通知画布刷新
+        ws = getattr(self, "canvas_ws", None)
+        if ws is not None:
+            ws.refresh_edge_status()
 
     def _rev_item_dbl(self, item):
         if item.column() == 2:
@@ -2714,6 +2873,11 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
+        # 白板未保存改动：保存/丢弃/取消 三选（Ctrl+S 分发同走 save_current）
+        ws = getattr(self, "canvas_ws", None)
+        if ws is not None and not ws.confirm_discard():
+            event.ignore()
+            return
         try:
             self.watcher.stop()
             self.store.close()
